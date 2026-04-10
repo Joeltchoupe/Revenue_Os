@@ -1,0 +1,244 @@
+{
+  "name": "03 — Treasury: Burn, Runway, Cash Alerts",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "revos/05-treasury",
+        "responseMode": "onReceived"
+      },
+      "id": "wh_treasury",
+      "name": "Webhook — Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [200, 300]
+    },
+    {
+      "parameters": {
+        "rule": { "interval": [{ "field": "cronExpression", "expression": "0 8 * * *" }] }
+      },
+      "id": "cron_treasury",
+      "name": "Cron — Daily 08:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [200, 460]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.PYTHON_SERVICE_URL}}/treasury/snapshot",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [{ "name": "x-service-key", "value": "={{$env.SERVICE_SECRET_KEY}}" }] },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "tenant_id", "value": "={{$env.TENANT_ID}}" }
+          ]
+        },
+        "options": { "response": { "response": { "neverError": true } }, "timeout": 30000 }
+      },
+      "id": "calc_snapshot",
+      "name": "Python — Calculate Treasury Snapshot (UC12+UC13)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [440, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Handle Python service failure gracefully\nconst res = $input.first().json;\n\n// Check for HTTP error or service unavailable\nif (res.error || res.statusCode >= 400) {\n  console.error('[treasury] Python service failed:', JSON.stringify(res));\n  // Try to get last known snapshot from Supabase as fallback\n  return [{ json: { _calculation_failed: true, error: res.error || res.detail || 'Unknown error' } }];\n}\n\n// Validate required fields exist\nconst required = ['cash', 'burn_rate', 'runway_months', 'alert_level'];\nconst missing = required.filter(f => res[f] === undefined || res[f] === null);\nif (missing.length > 0) {\n  console.error('[treasury] Missing fields:', missing);\n  return [{ json: { _calculation_failed: true, error: `Missing fields: ${missing.join(', ')}` } }];\n}\n\n// Add warnings from Python service\nconst warnings = res.warnings || [];\nif (res.data_freshness === 'stale') {\n  warnings.push('Using stale bank balance — live API was unavailable');\n}\n\nconsole.log(`[treasury] Snapshot OK: runway=${res.runway_months}mo alert=${res.alert_level}`);\nreturn [{ json: { ...res, _calculation_failed: false, _warnings: warnings } }];"
+      },
+      "id": "handle_snapshot",
+      "name": "Handle Snapshot Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [{ "value1": "={{$json._calculation_failed}}", "value2": false }]
+        }
+      },
+      "id": "calc_ok",
+      "name": "Calculation OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT cash, burn_rate, projected_revenue, runway_months, alert_level, safe_budget, currency, calculated_at, warnings\nFROM treasury_snapshots\nWHERE tenant_id = '$(TENANT_ID)'\nORDER BY calculated_at DESC\nLIMIT 2;"
+      },
+      "id": "fetch_prev_snapshot",
+      "name": "Supabase — Fetch Previous Snapshot",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1120, 200],
+      "credentials": { "postgres": { "id": "supabase_pg", "name": "Supabase PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const current  = $('Handle Snapshot Result').first().json;\nconst snapshots = $('Supabase — Fetch Previous Snapshot').all().map(i => i.json);\nconst prev = snapshots[1] || snapshots[0] || null;\n\nconst runwayChange = prev\n  ? parseFloat(current.runway_months) - parseFloat(prev.runway_months)\n  : 0;\n\nconst changeDir = runwayChange > 0.1 ? 'improved' : runwayChange < -0.1 ? 'degraded' : 'stable';\n\nreturn [{\n  json: {\n    ...current,\n    prev_runway_months: prev?.runway_months || null,\n    prev_burn_rate: prev?.burn_rate || null,\n    runway_change: parseFloat(runwayChange.toFixed(1)),\n    runway_change_direction: changeDir\n  }\n}];"
+      },
+      "id": "enrich_snapshot",
+      "name": "Enrich with Trend Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 200]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [{ "value1": "={{$json.alert_level}}", "operation": "notEqual", "value2": "HEALTHY" }]
+        }
+      },
+      "id": "needs_alert",
+      "name": "Alert Level != HEALTHY? (UC14)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1560, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build treasury explanation prompt for Claude\n// Only called when alert level is WARNING or CRITICAL\nconst snap = $input.first().json;\nconst curr = snap.currency || 'USD';\nconst fmt  = n => parseFloat(n || 0).toLocaleString('en-US', { maximumFractionDigits: 0 });\n\nconst prevRunwayLine = snap.prev_runway_months\n  ? `Previous runway: ${snap.prev_runway_months} months`\n  : 'No previous snapshot for comparison';\n\nconst warningsLine = (snap._warnings || []).length > 0\n  ? `DATA QUALITY WARNINGS: ${snap._warnings.join('; ')}`\n  : '';\n\nconst prompt = `You are a CFO advisor speaking directly to a founder. Be direct. No corporate language.\n\nTREASURY SNAPSHOT\nCash: ${curr} ${fmt(snap.cash)}\nMonthly burn: ${curr} ${fmt(snap.burn_rate)}\nProjected revenue (30d): ${curr} ${fmt(snap.projected_revenue)}\nRunway: ${snap.runway_months} months\nAlert level: ${snap.alert_level}\nSafe ad/growth budget this month: ${curr} ${fmt(snap.safe_budget)}\nRunway trend: ${snap.runway_change_direction} (${snap.runway_change > 0 ? '+' : ''}${snap.runway_change} months vs last check)\n${prevRunwayLine}\n${warningsLine}\n\nOUTPUT in this exact format:\nSITUATION:\n[1-2 sentences. Specific numbers. Explain the runway situation and ONE primary cause.]\n\nRISK:\n[1 sentence. What concretely happens if this trajectory continues? Name a date or threshold.]\n\nACTION:\n1. [Most impactful action → estimated +X months runway or $X saved]\n2. [Second action → impact]\n3. [Third action if relevant → impact]\n\nIMPORTANT: The numbers you cite MUST match the snapshot above. Do not invent figures.`;\n\nreturn [{ json: { ...snap, _treasury_prompt: prompt } }];"
+      },
+      "id": "build_treasury_prompt",
+      "name": "Build Treasury Explanation Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1780, 100]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "modelId": "claude-sonnet-4-6",
+        "messages": { "values": [{ "role": "user", "content": "={{$json._treasury_prompt}}" }] },
+        "options": { "maxTokens": 400, "temperature": 0.3 }
+      },
+      "id": "claude_treasury",
+      "name": "Claude — Treasury Explanation",
+      "type": "@n8n/n8n-nodes-langchain.anthropic",
+      "typeVersion": 1,
+      "position": [2000, 100],
+      "credentials": { "anthropicApi": { "id": "anthropic_main", "name": "Revos Anthropic" } }
+    },
+    {
+      "parameters": {
+        "url": "={{$env.PYTHON_SERVICE_URL}}/validate/llm-output",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [{ "name": "x-service-key", "value": "={{$env.SERVICE_SECRET_KEY}}" }] },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "tenant_id", "value": "={{$env.TENANT_ID}}" },
+            { "name": "output_type", "value": "treasury" },
+            { "name": "raw_output", "value": "={{$('Claude — Treasury Explanation').first().json.content[0].text}}" },
+            { "name": "context", "value": "={{JSON.stringify({ runway_months: $('Build Treasury Explanation Prompt').first().json.runway_months, burn_rate: $('Build Treasury Explanation Prompt').first().json.burn_rate })}}" }
+          ]
+        },
+        "options": { "response": { "response": { "neverError": true } } }
+      },
+      "id": "validate_treasury",
+      "name": "Python — Validate Treasury Output",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2220, 100]
+    },
+    {
+      "parameters": {
+        "jsCode": "const snap     = $('Build Treasury Explanation Prompt').first().json;\nconst validated = $input.first().json;\nconst curr     = snap.currency || 'USD';\nconst fmt      = n => parseFloat(n || 0).toLocaleString('en-US', { maximumFractionDigits: 0 });\n\n// Fall back to raw if validation failed\nconst explanation = validated.valid\n  ? validated.output\n  : $('Claude — Treasury Explanation').first().json.content?.[0]?.text || 'Analysis unavailable.';\n\nconst emoji = snap.alert_level === 'CRITICAL' ? '🚨' : '⚠️';\nconst trendEmoji = snap.runway_change_direction === 'improved' ? '📈' : snap.runway_change_direction === 'degraded' ? '📉' : '➡️';\n\nconst freshnessBadge = snap.data_freshness === 'stale' ? ' _(stale data)_' : '';\n\nconst message = [\n  `${emoji} *Treasury ${snap.alert_level} — ${snap.runway_months} months runway*${freshnessBadge}`,\n  '',\n  `${trendEmoji} *${snap.runway_change_direction.charAt(0).toUpperCase() + snap.runway_change_direction.slice(1)}* vs last check (${snap.runway_change > 0 ? '+' : ''}${snap.runway_change} mo)`,\n  `💰 Cash: *${curr} ${fmt(snap.cash)}*  ·  Burn: ${curr} ${fmt(snap.burn_rate)}/mo  ·  Safe budget: ${curr} ${fmt(snap.safe_budget)}`,\n  '',\n  explanation,\n  '',\n  ...(validated.warnings?.length ? [`_Warnings: ${validated.warnings.join(' | ')}_`] : [])\n].join('\\n');\n\nreturn [{ json: { ...snap, slack_message: message, explanation } }];"
+      },
+      "id": "format_alert",
+      "name": "Format Cash Alert (UC14)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2440, 100]
+    },
+    {
+      "parameters": {
+        "webhookUrl": "={{$env.SLACK_WEBHOOK_URL}}",
+        "text": "={{$json.slack_message}}"
+      },
+      "id": "slack_treasury_alert",
+      "name": "Slack — Cash Alert (UC14)",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 1,
+      "position": [2660, 100],
+      "credentials": { "slackApi": { "id": "slack_main", "name": "Revos Slack" } }
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "table": "recommendations",
+        "additionalFields": {
+          "additionalFields": [
+            { "name": "tenant_id", "value": "={{$env.TENANT_ID}}" },
+            { "name": "agent", "value": "03_treasury" },
+            { "name": "rec_type", "value": "cash_alert" },
+            { "name": "data", "value": "={{JSON.stringify({ runway_months: $json.runway_months, alert_level: $json.alert_level, burn_rate: $json.burn_rate, cash: $json.cash, explanation: $json.explanation })}}" },
+            { "name": "priority", "value": "={{$json.alert_level === 'CRITICAL' ? 'CRITICAL' : 'HIGH'}}" },
+            { "name": "status", "value": "pending" }
+          ]
+        }
+      },
+      "id": "insert_treasury_rec",
+      "name": "Supabase — Store Alert as Recommendation",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [2660, 260],
+      "credentials": { "postgres": { "id": "supabase_pg", "name": "Supabase PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Healthy snapshot — no alert needed, but log for the brief\nconst snap = $('Enrich with Trend Data').first().json;\nconst curr = snap.currency || 'USD';\nconst fmt  = n => parseFloat(n || 0).toLocaleString('en-US', { maximumFractionDigits: 0 });\nconsole.log(`[treasury] ${snap.alert_level}: runway=${snap.runway_months}mo cash=${curr}${fmt(snap.cash)}`);\n// No Slack message — healthy is quiet\nreturn [{ json: { skipped_alert: true, reason: 'HEALTHY — no alert needed', snapshot: snap } }];"
+      },
+      "id": "healthy_noop",
+      "name": "Healthy — No Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1780, 340]
+    },
+    {
+      "parameters": {
+        "webhookUrl": "={{$env.SLACK_WEBHOOK_URL}}",
+        "text": "🚨 *Treasury Calculation Failed*\n\nThe treasury snapshot could not be calculated.\nError: ={{$json.error}}\n\n_Manual review required. Check Supabase logs._"
+      },
+      "id": "slack_calc_failed",
+      "name": "Slack — Calculation Failure Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 1,
+      "position": [1120, 440],
+      "credentials": { "slackApi": { "id": "slack_main", "name": "Revos Slack" } }
+    }
+  ],
+  "connections": {
+    "Webhook — Trigger":    { "main": [[{ "node": "Python — Calculate Treasury Snapshot (UC12+UC13)", "type": "main", "index": 0 }]] },
+    "Cron — Daily 08:00":  { "main": [[{ "node": "Python — Calculate Treasury Snapshot (UC12+UC13)", "type": "main", "index": 0 }]] },
+    "Python — Calculate Treasury Snapshot (UC12+UC13)": { "main": [[{ "node": "Handle Snapshot Result", "type": "main", "index": 0 }]] },
+    "Handle Snapshot Result": { "main": [[{ "node": "Calculation OK?", "type": "main", "index": 0 }]] },
+    "Calculation OK?": { "main": [
+      [{ "node": "Supabase — Fetch Previous Snapshot", "type": "main", "index": 0 }],
+      [{ "node": "Slack — Calculation Failure Alert", "type": "main", "index": 0 }]
+    ]},
+    "Supabase — Fetch Previous Snapshot": { "main": [[{ "node": "Enrich with Trend Data", "type": "main", "index": 0 }]] },
+    "Enrich with Trend Data": { "main": [[{ "node": "Alert Level != HEALTHY? (UC14)", "type": "main", "index": 0 }]] },
+    "Alert Level != HEALTHY? (UC14)": { "main": [
+      [{ "node": "Build Treasury Explanation Prompt", "type": "main", "index": 0 }],
+      [{ "node": "Healthy — No Alert", "type": "main", "index": 0 }]
+    ]},
+    "Build Treasury Explanation Prompt": { "main": [[{ "node": "Claude — Treasury Explanation", "type": "main", "index": 0 }]] },
+    "Claude — Treasury Explanation": { "main": [[{ "node": "Python — Validate Treasury Output", "type": "main", "index": 0 }]] },
+    "Python — Validate Treasury Output": { "main": [[{ "node": "Format Cash Alert (UC14)", "type": "main", "index": 0 }]] },
+    "Format Cash Alert (UC14)": { "main": [
+      [{ "node": "Slack — Cash Alert (UC14)", "type": "main", "index": 0 }],
+      [{ "node": "Supabase — Store Alert as Recommendation", "type": "main", "index": 0 }]
+    ]}
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1", "errorWorkflow": "error-handler" },
+  "tags": ["revos", "treasury"],
+  "meta": { "revos_version": "1.0.0", "description": "UC12+13+14: Python calculates burn/runway, Claude explains (validated), Slack alerts if WARNING/CRITICAL." }
+}
