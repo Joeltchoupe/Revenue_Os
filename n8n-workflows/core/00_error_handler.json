@@ -1,0 +1,68 @@
+{
+  "name": "00 — Error Handler",
+  "nodes": [
+    {
+      "parameters": { "httpMethod": "POST", "path": "revos/error-handler" },
+      "id": "wh_error",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [200, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const err = $input.first().json;\nconst workflowName = err.workflow?.name || 'unknown';\nconst nodeName     = err.execution?.lastNodeExecuted || 'unknown';\nconst errorMsg     = err.execution?.error?.message || 'No error message';\nconst errorStack   = err.execution?.error?.stack || '';\nconst execId       = err.execution?.id || 'unknown';\nconst tenantId     = process.env.TENANT_ID || 'unknown';\n\nconsole.error(`[error-handler] Workflow: ${workflowName} | Node: ${nodeName} | Error: ${errorMsg}`);\n\nconst slackMsg = [\n  `🔴 *Revenue OS — Workflow Error*`,\n  `*Workflow:* ${workflowName}`,\n  `*Failed node:* ${nodeName}`,\n  `*Tenant:* ${tenantId}`,\n  `*Execution ID:* ${execId}`,\n  `*Error:* ${errorMsg.substring(0, 500)}`,\n  `*Time:* ${new Date().toISOString()}`,\n  '',\n  '_Check n8n execution logs for full stack trace._'\n].join('\\n');\n\nreturn [{ json: { slack_message: slackMsg, workflow: workflowName, node: nodeName, error: errorMsg, tenant_id: tenantId, exec_id: execId } }];"
+      },
+      "id": "format_error",
+      "name": "Format Error Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 300]
+    },
+    {
+      "parameters": {
+        "webhookUrl": "={{$env.SLACK_WEBHOOK_URL}}",
+        "text": "={{$json.slack_message}}"
+      },
+      "id": "slack_error",
+      "name": "Slack — Error Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 1,
+      "position": [680, 300],
+      "credentials": { "slackApi": { "id": "slack_main", "name": "Revos Slack" } }
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "table": "audit_logs",
+        "additionalFields": {
+          "additionalFields": [
+            { "name": "tenant_id", "value": "={{$json.tenant_id}}" },
+            { "name": "actor", "value": "system" },
+            { "name": "action", "value": "workflow_error" },
+            { "name": "resource_type", "value": "workflow" },
+            { "name": "resource_id", "value": "={{$json.exec_id}}" },
+            { "name": "data", "value": "={{JSON.stringify({ workflow: $json.workflow, node: $json.node, error: $json.error })}}" }
+          ]
+        }
+      },
+      "id": "log_error",
+      "name": "Supabase — Log Error",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [680, 460],
+      "credentials": { "postgres": { "id": "supabase_pg", "name": "Supabase PostgreSQL" } }
+    }
+  ],
+  "connections": {
+    "Error Trigger":       { "main": [[{ "node": "Format Error Alert", "type": "main", "index": 0 }]] },
+    "Format Error Alert":  { "main": [
+      [{ "node": "Slack — Error Alert", "type": "main", "index": 0 }],
+      [{ "node": "Supabase — Log Error", "type": "main", "index": 0 }]
+    ]}
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "tags": ["revos", "core", "error"],
+  "meta": { "revos_version": "1.0.0", "description": "Global error handler. All workflows reference this. Any failure triggers Slack alert + Supabase audit log." }
+}

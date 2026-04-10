@@ -1,0 +1,188 @@
+{
+  "name": "06 — Feedback Loop & RAG Enrichment",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": { "interval": [{ "field": "cronExpression", "expression": "0 5 * * *" }] }
+      },
+      "id": "cron_feedback",
+      "name": "Cron — Daily 05:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [200, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT r.id, r.tenant_id, r.agent, r.rec_type, r.data, r.priority, r.status, r.created_at\nFROM recommendations r\nWHERE r.tenant_id = '$(TENANT_ID)'\n  AND r.status = 'approved'\n  AND r.outcome_score IS NULL\n  AND r.created_at <= NOW() - INTERVAL '30 days'\nORDER BY r.created_at ASC\nLIMIT 20;"
+      },
+      "id": "fetch_mature",
+      "name": "Supabase — Fetch Mature Recommendations",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [440, 300],
+      "credentials": { "postgres": { "id": "supabase_pg", "name": "Supabase PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const recs = $input.all().map(i => i.json);\nif (!recs || recs.length === 0) {\n  return [{ json: { skipped: true, reason: 'No mature recommendations to score' } }];\n}\nconsole.log(`[feedback] Processing ${recs.length} mature recommendations`);\nreturn recs.map(r => {\n  let data = {};\n  try { data = typeof r.data === 'string' ? JSON.parse(r.data) : (r.data || {}); } catch(e) {}\n  return { json: { ...r, _data: data } };\n});"
+      },
+      "id": "prepare_recs",
+      "name": "Prepare Recommendations",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "conditions": { "boolean": [{ "value1": "={{$json.skipped}}", "operation": "notEqual", "value2": true }] }
+      },
+      "id": "has_recs",
+      "name": "Has Recs to Score?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT e.id, e.lead_id, e.subject, e.thread_id, e.status,\n       COALESCE(er.reply_received, false) as reply_received\nFROM emails_sent e\nLEFT JOIN email_replies er ON er.draft_id = e.draft_id\nWHERE e.tenant_id = '$(TENANT_ID)'\n  AND e.lead_id = '$(lead_id)'\n  AND e.status = 'sent'\nORDER BY e.sent_at DESC LIMIT 1;"
+      },
+      "id": "check_email_outcome",
+      "name": "Supabase — Check Email Reply",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1120, 200],
+      "credentials": { "postgres": { "id": "supabase_pg", "name": "Supabase PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT crm_id, stage, amount, status\nFROM deals\nWHERE tenant_id = '$(TENANT_ID)'\n  AND id = '$(deal_id)'\nLIMIT 1;"
+      },
+      "id": "check_deal_outcome",
+      "name": "Supabase — Check Deal Progress",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1120, 440],
+      "credentials": { "postgres": { "id": "supabase_pg", "name": "Supabase PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const rec      = $('Prepare Recommendations').first().json;\nconst emailRes = $('Supabase — Check Email Reply').first()?.json;\nconst dealRes  = $('Supabase — Check Deal Progress').first()?.json;\n\nlet outcomeScore = 50; // unknown default\nlet outcomeNote  = 'No measurable outcome found — using neutral score';\n\n// Email outcome\nif (emailRes?.reply_received) {\n  outcomeScore = 100;\n  outcomeNote  = 'Email received a reply';\n} else if (emailRes && !emailRes.reply_received) {\n  outcomeScore = 15;\n  outcomeNote  = 'Email sent, no reply after 30 days';\n}\n\n// Deal outcome (overrides if more specific)\nif (dealRes?.status) {\n  const stage = (dealRes.stage || '').toLowerCase();\n  if (dealRes.status === 'won' || stage.includes('closed won') || stage.includes('closedwon')) {\n    outcomeScore = 100;\n    outcomeNote  = 'Deal closed won';\n  } else if (dealRes.status === 'lost' || stage.includes('closed lost')) {\n    outcomeScore = 0;\n    outcomeNote  = 'Deal closed lost';\n  } else if (stage.includes('contract') || stage.includes('negotiation')) {\n    outcomeScore = 75;\n    outcomeNote  = 'Deal progressed to late stage';\n  } else if (stage.includes('proposal') || stage.includes('demo')) {\n    outcomeScore = 55;\n    outcomeNote  = 'Deal at proposal/demo stage';\n  }\n}\n\nconst shouldStoreRAG = outcomeScore >= 70;\n\nconsole.log(`[feedback] rec=${rec.id} rec_type=${rec.rec_type} score=${outcomeScore} rag=${shouldStoreRAG}`);\n\nreturn [{\n  json: {\n    rec_id:         rec.id,\n    tenant_id:      rec.tenant_id,\n    agent:          rec.agent,\n    rec_type:       rec.rec_type,\n    rec_data:       rec._data,\n    outcome_score:  outcomeScore,\n    outcome_note:   outcomeNote,\n    should_store_rag: shouldStoreRAG\n  }\n}];"
+      },
+      "id": "score_outcome",
+      "name": "Score Outcome",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1360, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE recommendations\nSET outcome_score = $(outcome_score),\n    outcome_note = '$(outcome_note)',\n    outcome_measured_at = NOW(),\n    updated_at = NOW()\nWHERE id = '$(rec_id)';"
+      },
+      "id": "update_outcome",
+      "name": "Supabase — Save Outcome Score",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1580, 300],
+      "credentials": { "postgres": { "id": "supabase_pg", "name": "Supabase PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "conditions": { "boolean": [{ "value1": "={{$json.should_store_rag}}", "value2": true }] }
+      },
+      "id": "store_rag_check",
+      "name": "Score >= 70 → Store in RAG?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1800, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build content string for embedding\nconst d = $json;\nconst data = d.rec_data || {};\n\n// Build a rich semantic string that captures what worked\nconst parts = [\n  `Type: ${d.rec_type}`,\n  `Agent: ${d.agent}`,\n  data.email_subject ? `Email subject: ${data.email_subject}` : '',\n  data.email_body    ? `Email body snippet: ${data.email_body?.substring(0, 300)}` : '',\n  data.action        ? `Recommended action: ${data.action}` : '',\n  data.diagnosis     ? `Diagnosis: ${data.diagnosis}` : '',\n  data.blocking_factor ? `Blocking factor: ${data.blocking_factor}` : '',\n  data.deal_stage    ? `Deal stage: ${data.deal_stage}` : '',\n  data.industry      ? `Industry: ${data.industry}` : '',\n  `Outcome: ${d.outcome_note} (score: ${d.outcome_score})`\n].filter(Boolean).join(' | ');\n\nreturn [{\n  json: {\n    ...d,\n    _embed_content: parts,\n    _metadata: {\n      type:          d.rec_type,\n      agent:         d.agent,\n      outcome_score: d.outcome_score,\n      rec_id:        d.rec_id,\n      subject:       data.email_subject || null,\n      body:          data.email_body?.substring(0, 500) || null,\n      action:        data.action || null,\n      stage:         data.deal_stage || null\n    }\n  }\n}];"
+      },
+      "id": "prepare_embedding",
+      "name": "Prepare Content for Embedding",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2020, 200]
+    },
+    {
+      "parameters": {
+        "url": "https://api.openai.com/v1/embeddings",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [{ "name": "Authorization", "value": "=Bearer {{$env.OPENAI_API_KEY}}" }] },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "model", "value": "text-embedding-3-small" },
+            { "name": "input", "value": "={{$json._embed_content}}" }
+          ]
+        },
+        "options": { "response": { "response": { "neverError": true } }, "timeout": 20000 }
+      },
+      "id": "generate_embedding",
+      "name": "OpenAI — Generate Embedding",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2240, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "const prep   = $('Prepare Content for Embedding').first().json;\nconst embRes = $input.first().json;\n\nif (embRes.error) {\n  console.error('[feedback] Embedding failed:', embRes.error);\n  // Don't crash — skip RAG store for this one\n  return [{ json: { _embedding_failed: true, rec_id: prep.rec_id } }];\n}\n\nconst embedding = embRes.data?.[0]?.embedding;\nif (!embedding || embedding.length !== 1536) {\n  console.error('[feedback] Unexpected embedding shape');\n  return [{ json: { _embedding_failed: true, rec_id: prep.rec_id } }];\n}\n\nreturn [{\n  json: {\n    rec_id:    prep.rec_id,\n    tenant_id: prep.tenant_id,\n    content:   prep._embed_content,\n    embedding: JSON.stringify(embedding),\n    metadata:  JSON.stringify(prep._metadata)\n  }\n}];"
+      },
+      "id": "parse_embedding",
+      "name": "Parse Embedding Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2460, 200]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "table": "memory_chunks",
+        "additionalFields": {
+          "additionalFields": [
+            { "name": "tenant_id", "value": "={{$json.tenant_id}}" },
+            { "name": "content",   "value": "={{$json.content}}" },
+            { "name": "embedding", "value": "={{$json.embedding}}" },
+            { "name": "metadata",  "value": "={{$json.metadata}}" }
+          ]
+        }
+      },
+      "id": "store_rag",
+      "name": "Supabase — Store in memory_chunks",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [2680, 200],
+      "credentials": { "postgres": { "id": "supabase_pg", "name": "Supabase PostgreSQL" } }
+    }
+  ],
+  "connections": {
+    "Cron — Daily 05:00": { "main": [[{ "node": "Supabase — Fetch Mature Recommendations", "type": "main", "index": 0 }]] },
+    "Supabase — Fetch Mature Recommendations": { "main": [[{ "node": "Prepare Recommendations", "type": "main", "index": 0 }]] },
+    "Prepare Recommendations": { "main": [[{ "node": "Has Recs to Score?", "type": "main", "index": 0 }]] },
+    "Has Recs to Score?": { "main": [
+      [{ "node": "Supabase — Check Email Reply", "type": "main", "index": 0 }],
+      []
+    ]},
+    "Supabase — Check Email Reply":  { "main": [[{ "node": "Score Outcome", "type": "main", "index": 0 }]] },
+    "Supabase — Check Deal Progress":{ "main": [[{ "node": "Score Outcome", "type": "main", "index": 0 }]] },
+    "Score Outcome":   { "main": [[{ "node": "Supabase — Save Outcome Score", "type": "main", "index": 0 }]] },
+    "Supabase — Save Outcome Score": { "main": [[{ "node": "Score >= 70 → Store in RAG?", "type": "main", "index": 0 }]] },
+    "Score >= 70 → Store in RAG?": { "main": [
+      [{ "node": "Prepare Content for Embedding", "type": "main", "index": 0 }],
+      []
+    ]},
+    "Prepare Content for Embedding": { "main": [[{ "node": "OpenAI — Generate Embedding", "type": "main", "index": 0 }]] },
+    "OpenAI — Generate Embedding":   { "main": [[{ "node": "Parse Embedding Result", "type": "main", "index": 0 }]] },
+    "Parse Embedding Result":        { "main": [[{ "node": "Supabase — Store in memory_chunks", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1", "errorWorkflow": "error-handler" },
+  "tags": ["revos", "core", "feedback"],
+  "meta": { "revos_version": "1.0.0", "description": "Daily at 05:00. Scores outcomes of 30-day-old recommendations. Embeds successful patterns into pgvector memory_chunks for RAG." }
+}

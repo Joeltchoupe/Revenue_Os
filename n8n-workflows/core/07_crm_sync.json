@@ -1,0 +1,75 @@
+{
+  "name": "07 — CRM Sync",
+  "nodes": [
+    {
+      "parameters": { "rule": { "interval": [{ "field": "cronExpression", "expression": "0 2 * * *" }] } },
+      "id": "cron_sync",
+      "name": "Cron — Daily 02:00 Sync",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [200, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.PYTHON_SERVICE_URL}}/crm/sync",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [{ "name": "x-service-key", "value": "={{$env.SERVICE_SECRET_KEY}}" }] },
+        "sendBody": true,
+        "bodyParameters": { "parameters": [
+          { "name": "tenant_id", "value": "={{$env.TENANT_ID}}" },
+          { "name": "resource", "value": "contacts" },
+          { "name": "limit", "value": "200" }
+        ]},
+        "options": { "response": { "response": { "neverError": true } }, "timeout": 60000 }
+      },
+      "id": "sync_contacts",
+      "name": "Python — Sync Contacts",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [440, 220]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.PYTHON_SERVICE_URL}}/crm/sync",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [{ "name": "x-service-key", "value": "={{$env.SERVICE_SECRET_KEY}}" }] },
+        "sendBody": true,
+        "bodyParameters": { "parameters": [
+          { "name": "tenant_id", "value": "={{$env.TENANT_ID}}" },
+          { "name": "resource", "value": "deals" },
+          { "name": "limit", "value": "200" }
+        ]},
+        "options": { "response": { "response": { "neverError": true } }, "timeout": 60000 }
+      },
+      "id": "sync_deals",
+      "name": "Python — Sync Deals",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [440, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "const contacts = $('Python — Sync Contacts').first().json;\nconst deals    = $('Python — Sync Deals').first().json;\nconst errors   = [];\nif (contacts.error || contacts.statusCode >= 400) errors.push(`Contacts sync: ${contacts.detail || contacts.error}`);\nif (deals.error    || deals.statusCode >= 400)    errors.push(`Deals sync: ${deals.detail || deals.error}`);\nif (errors.length > 0) console.error('[crm-sync] Errors:', errors);\nconsole.log(`[crm-sync] contacts=${contacts.synced || 0} deals=${deals.synced || 0}`);\nreturn [{ json: { contacts_synced: contacts.synced || 0, deals_synced: deals.synced || 0, errors, completed_at: new Date().toISOString() } }];"
+      },
+      "id": "report_sync",
+      "name": "Report Sync Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 300]
+    }
+  ],
+  "connections": {
+    "Cron — Daily 02:00 Sync": { "main": [
+      [{ "node": "Python — Sync Contacts", "type": "main", "index": 0 }],
+      [{ "node": "Python — Sync Deals", "type": "main", "index": 0 }]
+    ]},
+    "Python — Sync Contacts": { "main": [[{ "node": "Report Sync Result", "type": "main", "index": 0 }]] },
+    "Python — Sync Deals":    { "main": [[{ "node": "Report Sync Result", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1", "errorWorkflow": "error-handler" },
+  "tags": ["revos", "integration"],
+  "meta": { "revos_version": "1.0.0", "description": "Daily at 02:00. Syncs contacts + deals from CRM to Supabase via Python service." }
+}

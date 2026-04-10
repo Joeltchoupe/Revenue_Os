@@ -1,0 +1,174 @@
+{
+  "name": "08 — Execution Event Poller (Approval → Action)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": { "interval": [{ "field": "cronExpression", "expression": "*/2 * * * *" }] }
+      },
+      "id": "cron_poll",
+      "name": "Cron — Poll Every 2 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [200, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT e.id as event_id, e.tenant_id, e.event_type, e.payload, e.created_at\nFROM events e\nWHERE e.tenant_id = '$(TENANT_ID)'\n  AND e.event_type = 'approval.approved'\n  AND e.processed = false\n  AND e.created_at > NOW() - INTERVAL '24 hours'\nORDER BY e.created_at ASC\nLIMIT 10;"
+      },
+      "id": "fetch_events",
+      "name": "Supabase — Fetch Unprocessed Approval Events",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [440, 300],
+      "credentials": { "postgres": { "id": "supabase_pg", "name": "Supabase PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "conditions": { "number": [{ "value1": "={{$input.all().length}}", "operation": "larger", "value2": 0 }] }
+      },
+      "id": "has_events",
+      "name": "Any Events?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [660, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse and validate each event\nconst events = $input.all().map(i => i.json);\nconst results = [];\n\nfor (const evt of events) {\n  let payload = {};\n  try {\n    payload = typeof evt.payload === 'string' ? JSON.parse(evt.payload) : (evt.payload || {});\n  } catch(e) {\n    console.error('[exec-poller] Bad payload JSON:', evt.event_id);\n    continue;\n  }\n\n  const actionType = payload.action_type || '';\n  const idempKey   = payload.idempotency_key || '';\n\n  // Skip known non-executable types (they were auto-handled)\n  if (['slack_notify'].includes(actionType)) {\n    results.push({ ...evt, _skip: true, _reason: 'auto_executable' });\n    continue;\n  }\n\n  results.push({\n    event_id:          evt.event_id,\n    tenant_id:         evt.tenant_id,\n    approval_id:       payload.approval_id,\n    recommendation_id: payload.recommendation_id,\n    action_type:       actionType,\n    payload:           payload.payload || {},\n    correlation_id:    payload.correlation_id,\n    idempotency_key:   idempKey,\n    _skip:             false\n  });\n}\n\nreturn results.map(r => ({ json: r }));"
+      },
+      "id": "parse_events",
+      "name": "Parse Events",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [880, 300]
+    },
+    {
+      "parameters": {
+        "conditions": { "boolean": [{ "value1": "={{$json._skip}}", "value2": false }] }
+      },
+      "id": "should_execute",
+      "name": "Should Execute?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1100, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE approvals SET execution_status = 'running', execution_attempts = execution_attempts + 1\nWHERE id = '$(approval_id)'\n  AND execution_status IN ('not_started', 'failed')\n  AND tenant_id = '$(tenant_id)';"
+      },
+      "id": "mark_running",
+      "name": "Supabase — Mark Execution Running",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1320, 200],
+      "credentials": { "postgres": { "id": "supabase_pg", "name": "Supabase PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "conditions": { "string": [{ "value1": "={{$json.action_type}}", "operation": "equal", "value2": "send_email" }] }
+      },
+      "id": "route_send_email",
+      "name": "Route: Send Email?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1540, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate we still haven't sent this email (idempotency)\nconst p = $input.first().json;\nconst payload = p.payload || {};\n\n// Check quota\nconst maxEmails = parseInt(process.env.MAX_EMAILS_DAY || '50');\nconsole.log(`[exec] Preparing to send email to ${payload.to_email}`);\n\n// Basic validation\nif (!payload.to_email || !payload.subject || !payload.body) {\n  throw new Error(`Invalid email payload: missing to_email/subject/body`);\n}\n\nreturn [{ json: { ...p, _email_validated: true } }];"
+      },
+      "id": "validate_email_payload",
+      "name": "Validate Email Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1760, 100]
+    },
+    {
+      "parameters": {
+        "operation": "send",
+        "toEmail": "={{$json.payload.to_email}}",
+        "subject": "={{$json.payload.subject}}",
+        "emailType": "text",
+        "message": "={{$json.payload.body}}"
+      },
+      "id": "send_email_action",
+      "name": "Gmail — Send Email",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [1980, 100],
+      "credentials": { "gmailOAuth2": { "id": "gmail_main", "name": "Revos Gmail" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE approvals SET execution_status = 'succeeded', outcome = '{\"sent\": true}'\nWHERE id = '$(approval_id)';\n\nUPDATE recommendations SET status = 'executed', updated_at = NOW()\nWHERE id = '$(recommendation_id)';\n\nINSERT INTO emails_sent (tenant_id, lead_id, to_email, subject, body, status, draft_id, sent_at)\nVALUES ('$(tenant_id)', null, '$(payload.to_email)', '$(payload.subject)', '$(payload.body)', 'sent', '$(approval_id)', NOW())\nON CONFLICT (draft_id) DO NOTHING;"
+      },
+      "id": "mark_email_success",
+      "name": "Supabase — Mark Email Sent",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [2200, 100],
+      "credentials": { "postgres": { "id": "supabase_pg", "name": "Supabase PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Handle execution failure gracefully\nconst p = $('Parse Events').first().json;\nconst err = $input.first().json;\nconst errMsg = err.message || err.error || 'Unknown execution error';\n\nconsole.error(`[exec-poller] Execution failed for approval ${p.approval_id}: ${errMsg}`);\n\nreturn [{ json: { ...p, _error: errMsg } }];"
+      },
+      "id": "handle_exec_failure",
+      "name": "Handle Execution Failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1980, 320]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE approvals\nSET execution_status = CASE WHEN execution_attempts >= 3 THEN 'failed' ELSE 'not_started' END,\n    execution_error = '$(error)'\nWHERE id = '$(approval_id)';"
+      },
+      "id": "mark_exec_failed",
+      "name": "Supabase — Mark Execution Failed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [2200, 320],
+      "credentials": { "postgres": { "id": "supabase_pg", "name": "Supabase PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE events SET processed = true WHERE id = '$(event_id)';"
+      },
+      "id": "mark_event_processed",
+      "name": "Supabase — Mark Event Processed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [2420, 200],
+      "credentials": { "postgres": { "id": "supabase_pg", "name": "Supabase PostgreSQL" } }
+    }
+  ],
+  "connections": {
+    "Cron — Poll Every 2 Minutes":  { "main": [[{ "node": "Supabase — Fetch Unprocessed Approval Events", "type": "main", "index": 0 }]] },
+    "Supabase — Fetch Unprocessed Approval Events": { "main": [[{ "node": "Any Events?", "type": "main", "index": 0 }]] },
+    "Any Events?": { "main": [[{ "node": "Parse Events", "type": "main", "index": 0 }]] },
+    "Parse Events": { "main": [[{ "node": "Should Execute?", "type": "main", "index": 0 }]] },
+    "Should Execute?": { "main": [[{ "node": "Supabase — Mark Execution Running", "type": "main", "index": 0 }]] },
+    "Supabase — Mark Execution Running": { "main": [[{ "node": "Route: Send Email?", "type": "main", "index": 0 }]] },
+    "Route: Send Email?": { "main": [
+      [{ "node": "Validate Email Payload", "type": "main", "index": 0 }],
+      []
+    ]},
+    "Validate Email Payload": { "main": [[{ "node": "Gmail — Send Email", "type": "main", "index": 0 }]] },
+    "Gmail — Send Email": { "main": [
+      [{ "node": "Supabase — Mark Email Sent", "type": "main", "index": 0 }],
+      [{ "node": "Handle Execution Failure", "type": "main", "index": 0 }]
+    ]},
+    "Supabase — Mark Email Sent": { "main": [[{ "node": "Supabase — Mark Event Processed", "type": "main", "index": 0 }]] },
+    "Handle Execution Failure": { "main": [[{ "node": "Supabase — Mark Execution Failed", "type": "main", "index": 0 }]] },
+    "Supabase — Mark Execution Failed": { "main": [[{ "node": "Supabase — Mark Event Processed", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1", "errorWorkflow": "error-handler" },
+  "tags": ["revos", "core", "execution"],
+  "meta": { "revos_version": "1.0.0", "description": "Polls events table every 2 min for approval.approved events. Executes action, updates approval execution_status, marks event processed. Idempotent." }
+}

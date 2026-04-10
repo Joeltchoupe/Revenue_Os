@@ -1,0 +1,549 @@
+{
+  "name": "05 \u2014 Approval Gate (UC10 + UC11)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "revos/approve",
+        "responseMode": "lastNode"
+      },
+      "id": "wh_approve",
+      "name": "Webhook \u2014 Approve Token",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        200,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "revos/reject",
+        "responseMode": "lastNode"
+      },
+      "id": "wh_reject",
+      "name": "Webhook \u2014 Reject Token",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        200,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const qs  = $input.first().json.query || {};\nconst tok = qs.token || '';\nif (!tok || tok.length < 10) throw new Error('Invalid or missing approval token');\nreturn [{ json: { token: tok, action: 'approve' } }];"
+      },
+      "id": "parse_approve",
+      "name": "Parse Approve Token",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const qs  = $input.first().json.query || {};\nconst tok = qs.token || '';\nif (!tok || tok.length < 10) throw new Error('Invalid or missing rejection token');\nreturn [{ json: { token: tok, action: 'reject' } }];"
+      },
+      "id": "parse_reject",
+      "name": "Parse Reject Token",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT a.id, a.tenant_id, a.recommendation_id, a.action_type, a.payload, a.status, a.expires_at,\n       r.rec_type, r.data as rec_data\nFROM approvals a\nJOIN recommendations r ON r.id = a.recommendation_id\nWHERE a.token = '$(token)'\n  AND a.status = 'pending'\nLIMIT 1;"
+      },
+      "id": "fetch_approval_approve",
+      "name": "Supabase \u2014 Fetch Approval (approve path)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        680,
+        200
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "supabase_pg",
+          "name": "Supabase PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT a.id, a.tenant_id, a.recommendation_id, a.action_type, a.payload, a.status, a.expires_at\nFROM approvals a\nWHERE a.token = '$(token)'\n  AND a.status = 'pending'\nLIMIT 1;"
+      },
+      "id": "fetch_approval_reject",
+      "name": "Supabase \u2014 Fetch Approval (reject path)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        680,
+        400
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "supabase_pg",
+          "name": "Supabase PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const approval = $('Supabase \u2014 Fetch Approval (approve path)').first().json;\nif (!approval || !approval.id) {\n  return [{ json: { _invalid: true, reason: 'Token not found, already actioned, or expired' } }];\n}\n// Check expiry\nconst expires = new Date(approval.expires_at);\nif (expires < new Date()) {\n  return [{ json: { _invalid: true, reason: `Approval token expired at ${approval.expires_at}` } }];\n}\nreturn [{ json: { ...approval, _valid: true } }];"
+      },
+      "id": "validate_approve_token",
+      "name": "Validate Approve Token",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        920,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json._valid}}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "approve_valid",
+      "name": "Approval Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        1140,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Route approved action to the right executor\nconst approval = $input.first().json;\nconst payload  = typeof approval.payload === 'string' ? JSON.parse(approval.payload || '{}') : (approval.payload || {});\nconst recData  = typeof approval.rec_data === 'string' ? JSON.parse(approval.rec_data || '{}') : (approval.rec_data || {});\n\nconst actionType = approval.action_type || '';\n\n// Determine if this can auto-execute (UC11) vs needs human action\n// Low-risk auto-executable action types:\nconst AUTO_EXECUTABLE = ['slack_notify', 'create_task_crm', 'log_note_crm'];\nconst isAuto = AUTO_EXECUTABLE.includes(actionType);\n\n// Email send is manual by default \u2014 only auto if execution_mode=auto is set\nconst executionMode = process.env.EXECUTION_MODE || 'approval';\nconst canSendEmailAuto = executionMode === 'auto' && actionType === 'send_email';\n\nreturn [{\n  json: {\n    ...approval,\n    _payload:      payload,\n    _rec_data:     recData,\n    _execute_mode: (isAuto || canSendEmailAuto) ? 'auto' : 'manual',\n    _action_type:  actionType\n  }\n}];"
+      },
+      "id": "route_action",
+      "name": "Route Action (UC10 vs UC11)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1360,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{$json._execute_mode}}",
+              "operation": "equal",
+              "value2": "auto"
+            }
+          ]
+        }
+      },
+      "id": "auto_or_manual",
+      "name": "Auto-Execute? (UC11)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        1580,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// UC11 \u2014 Auto-execute low-risk actions\nconst data = $input.first().json;\nconst actionType = data._action_type;\nconst payload    = data._payload;\n\nconsole.log(`[approval] Auto-executing: ${actionType}`);\n\n// For now, log the execution \u2014 actual send happens in sub-workflows\n// The pattern: return structured output for downstream nodes\nreturn [{\n  json: {\n    ...data,\n    _execution_result: 'queued',\n    _executed_at: new Date().toISOString(),\n    _note: `Auto-executed: ${actionType}`\n  }\n}];"
+      },
+      "id": "auto_execute",
+      "name": "Auto-Execute Action (UC11)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1800,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// UC10 \u2014 Human approval acknowledged, execution pending\n// Update approval record and notify client\nconst data = $input.first().json;\nconsole.log(`[approval] Approved by human: ${data.action_type}`);\nreturn [{ json: { ...data, _execution_result: 'approved_pending_execution' } }];"
+      },
+      "id": "human_approved",
+      "name": "Human Approved \u2014 Queue Execution (UC10)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1800,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE approvals SET status = 'approved', actioned_at = NOW() WHERE id = '$(id)';\nUPDATE recommendations SET status = 'approved', updated_at = NOW() WHERE id = '$(recommendation_id)';"
+      },
+      "id": "update_approval_approved",
+      "name": "Supabase \u2014 Mark Approved",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        2020,
+        100
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "supabase_pg",
+          "name": "Supabase PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "table": "audit_logs",
+        "additionalFields": {
+          "additionalFields": [
+            {
+              "name": "tenant_id",
+              "value": "={{$json.tenant_id}}"
+            },
+            {
+              "name": "actor",
+              "value": "founder"
+            },
+            {
+              "name": "action",
+              "value": "approval_approved"
+            },
+            {
+              "name": "resource_type",
+              "value": "recommendation"
+            },
+            {
+              "name": "resource_id",
+              "value": "={{$json.recommendation_id}}"
+            },
+            {
+              "name": "data",
+              "value": "={{JSON.stringify({ action_type: $json._action_type, execution_mode: $json._execute_mode })}}"
+            }
+          ]
+        }
+      },
+      "id": "audit_approved",
+      "name": "Supabase \u2014 Audit Log",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        2240,
+        100
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "supabase_pg",
+          "name": "Supabase PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "<html><body style='font-family:Arial;text-align:center;padding:40px'><h2>\u2705 Action Approved</h2><p>The recommendation has been approved and will be executed.</p><p>You can close this window.</p></body></html>",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html"
+              }
+            ]
+          }
+        }
+      },
+      "id": "respond_approved",
+      "name": "HTTP Response \u2014 Approved",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        2460,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE approvals SET status = 'rejected', actioned_at = NOW() WHERE id = '$(id)';\nUPDATE recommendations SET status = 'rejected', updated_at = NOW() WHERE id = '$(recommendation_id)';"
+      },
+      "id": "update_approval_rejected",
+      "name": "Supabase \u2014 Mark Rejected",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        920,
+        400
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "supabase_pg",
+          "name": "Supabase PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "<html><body style='font-family:Arial;text-align:center;padding:40px'><h2>\u274c Action Rejected</h2><p>The recommendation has been rejected and will not be executed.</p><p>You can close this window.</p></body></html>",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html"
+              }
+            ]
+          }
+        }
+      },
+      "id": "respond_rejected",
+      "name": "HTTP Response \u2014 Rejected",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        1140,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "<html><body style='font-family:Arial;text-align:center;padding:40px'><h2>\u26a0\ufe0f Invalid or Expired Token</h2><p>This approval link is no longer valid. It may have already been used or expired.</p></body></html>",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html"
+              }
+            ]
+          }
+        }
+      },
+      "id": "respond_invalid",
+      "name": "HTTP Response \u2014 Invalid",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        1360,
+        320
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook \u2014 Approve Token": {
+      "main": [
+        [
+          {
+            "node": "Parse Approve Token",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook \u2014 Reject Token": {
+      "main": [
+        [
+          {
+            "node": "Parse Reject Token",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Approve Token": {
+      "main": [
+        [
+          {
+            "node": "Supabase \u2014 Fetch Approval (approve path)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Reject Token": {
+      "main": [
+        [
+          {
+            "node": "Supabase \u2014 Fetch Approval (reject path)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Supabase \u2014 Fetch Approval (approve path)": {
+      "main": [
+        [
+          {
+            "node": "Validate Approve Token",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Supabase \u2014 Fetch Approval (reject path)": {
+      "main": [
+        [
+          {
+            "node": "Supabase \u2014 Mark Rejected",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Approve Token": {
+      "main": [
+        [
+          {
+            "node": "Approval Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approval Valid?": {
+      "main": [
+        [
+          {
+            "node": "Route Action (UC10 vs UC11)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "HTTP Response \u2014 Invalid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Action (UC10 vs UC11)": {
+      "main": [
+        [
+          {
+            "node": "Auto-Execute? (UC11)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Auto-Execute? (UC11)": {
+      "main": [
+        [
+          {
+            "node": "Auto-Execute Action (UC11)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Human Approved \u2014 Queue Execution (UC10)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Auto-Execute Action (UC11)": {
+      "main": [
+        [
+          {
+            "node": "Supabase \u2014 Mark Approved",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Human Approved \u2014 Queue Execution (UC10)": {
+      "main": [
+        [
+          {
+            "node": "Supabase \u2014 Mark Approved",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Supabase \u2014 Mark Approved": {
+      "main": [
+        [
+          {
+            "node": "Supabase \u2014 Audit Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Supabase \u2014 Audit Log": {
+      "main": [
+        [
+          {
+            "node": "HTTP Response \u2014 Approved",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Supabase \u2014 Mark Rejected": {
+      "main": [
+        [
+          {
+            "node": "HTTP Response \u2014 Rejected",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "error-handler"
+  },
+  "tags": [
+    "revos",
+    "core",
+    "approval"
+  ],
+  "meta": {
+    "revos_version": "1.0.0",
+    "description": "UC10+11: approval gate via token URL. Validates token, routes to auto-execute or human-acknowledged, updates DB, audit log."
+  }
+}

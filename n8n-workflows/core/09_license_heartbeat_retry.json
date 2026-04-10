@@ -1,0 +1,157 @@
+{
+  "name": "09 — License Check + Heartbeat + Delivery Retry",
+  "nodes": [
+    {
+      "parameters": { "rule": { "interval": [{ "field": "cronExpression", "expression": "*/15 * * * *" }] } },
+      "id": "cron_heartbeat",
+      "name": "Cron — Every 15 Min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [200, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.SUPABASE_URL}}/functions/v1/validate_license",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "Authorization", "value": "=Bearer {{$env.SUPABASE_SERVICE_ROLE_KEY}}" },
+          { "name": "Content-Type", "value": "application/json" }
+        ]},
+        "sendBody": true,
+        "bodyParameters": { "parameters": [
+          { "name": "tenant_id", "value": "={{$env.TENANT_ID}}" },
+          { "name": "license_token", "value": "={{$env.LICENSE_TOKEN}}" }
+        ]},
+        "options": { "response": { "response": { "neverError": true } }, "timeout": 10000 }
+      },
+      "id": "validate_license",
+      "name": "Supabase — Validate License",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [440, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const res = $input.first().json;\nif (!res.valid) {\n  console.warn(`[license] INVALID: ${res.reason}`);\n  // Don't crash — just stop workflows by not triggering anything\n  return [{ json: { _license_valid: false, reason: res.reason } }];\n}\nconsole.log(`[license] Valid. Plan: ${res.plan}`);\nreturn [{ json: { _license_valid: true, plan: res.plan, entitlements: res.entitlements } }];"
+      },
+      "id": "check_license",
+      "name": "Check License Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [660, 300]
+    },
+    {
+      "parameters": {
+        "conditions": { "boolean": [{ "value1": "={{$json._license_valid}}", "value2": true }] }
+      },
+      "id": "license_valid",
+      "name": "License Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [880, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.PYTHON_SERVICE_URL}}/health/integrations/{{$env.TENANT_ID}}",
+        "method": "GET",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [{ "name": "x-service-key", "value": "={{$env.SERVICE_SECRET_KEY}}" }] },
+        "options": { "response": { "response": { "neverError": true } }, "timeout": 15000 }
+      },
+      "id": "check_connectors",
+      "name": "Python — Check Integration Health",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1100, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "const res   = $input.first().json;\nconst tenantId = $env.TENANT_ID;\nconst integrations = res.integrations || {};\nconst rows = [];\n\nfor (const [connector, health] of Object.entries(integrations)) {\n  rows.push({\n    tenant_id:    tenantId,\n    connector,\n    status:       health.status || 'unknown',\n    latency_ms:   health.latency_ms || null,\n    error_detail: health.error || null,\n    checked_at:   new Date().toISOString()\n  });\n}\nreturn rows.map(r => ({ json: r }));"
+      },
+      "id": "format_health",
+      "name": "Format Health Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1320, 200]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO connector_health (tenant_id, connector, status, latency_ms, error_detail, checked_at)\nVALUES ('$(tenant_id)', '$(connector)', '$(status)', $(latency_ms)::int, '$(error_detail)', '$(checked_at)')\nON CONFLICT (tenant_id, connector) DO UPDATE\nSET status = EXCLUDED.status, latency_ms = EXCLUDED.latency_ms,\n    error_detail = EXCLUDED.error_detail, checked_at = EXCLUDED.checked_at;"
+      },
+      "id": "upsert_connector_health",
+      "name": "Supabase — Upsert Connector Health",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1540, 200],
+      "credentials": { "postgres": { "id": "supabase_pg", "name": "Supabase PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE tenant_instances\nSET last_heartbeat_at = NOW(), n8n_status = 'active'\nWHERE tenant_id = '$(TENANT_ID)';"
+      },
+      "id": "update_heartbeat",
+      "name": "Supabase — Write Heartbeat",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1100, 400],
+      "credentials": { "postgres": { "id": "supabase_pg", "name": "Supabase PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Retry failed delivery (Slack failed, now try email)\nSELECT r.id, r.tenant_id, r.rec_type, r.data, r.priority, r.correlation_id,\n       r.estimated_impact, r.why_recommended, r.delivery_attempts\nFROM recommendations r\nWHERE r.tenant_id = '$(TENANT_ID)'\n  AND r.delivery_status = 'failed'\n  AND r.delivery_attempts < 3\n  AND r.priority IN ('CRITICAL', 'HIGH')\n  AND r.created_at > NOW() - INTERVAL '48 hours'\nLIMIT 5;"
+      },
+      "id": "fetch_failed_deliveries",
+      "name": "Supabase — Fetch Failed Deliveries",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1100, 560],
+      "credentials": { "postgres": { "id": "supabase_pg", "name": "Supabase PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Re-trigger delivery for failed items\nconst items = $input.all().map(i => i.json);\nif (items.length === 0) return [{ json: { skipped: true } }];\nconsole.log(`[retry] Re-attempting delivery for ${items.length} failed recommendations`);\nreturn items.map(r => ({ json: { ...r, _retry: true } }));"
+      },
+      "id": "prep_retry",
+      "name": "Prepare Delivery Retry",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1320, 560]
+    },
+    {
+      "parameters": {
+        "webhookUrl": "={{$env.SLACK_WEBHOOK_URL}}",
+        "text": "=🔴 *License Invalid — Workflows Paused*\n\nTenant: {{$env.TENANT_ID}}\nReason: {{$json.reason}}\n\n_Contact support to renew your license._"
+      },
+      "id": "slack_license_invalid",
+      "name": "Slack — License Invalid Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 1,
+      "position": [880, 500],
+      "credentials": { "slackApi": { "id": "slack_main", "name": "Revos Slack" } }
+    }
+  ],
+  "connections": {
+    "Cron — Every 15 Min": { "main": [[{ "node": "Supabase — Validate License", "type": "main", "index": 0 }]] },
+    "Supabase — Validate License": { "main": [[{ "node": "Check License Result", "type": "main", "index": 0 }]] },
+    "Check License Result": { "main": [[{ "node": "License Valid?", "type": "main", "index": 0 }]] },
+    "License Valid?": { "main": [
+      [
+        { "node": "Python — Check Integration Health", "type": "main", "index": 0 },
+        { "node": "Supabase — Write Heartbeat", "type": "main", "index": 0 },
+        { "node": "Supabase — Fetch Failed Deliveries", "type": "main", "index": 0 }
+      ],
+      [{ "node": "Slack — License Invalid Alert", "type": "main", "index": 0 }]
+    ]},
+    "Python — Check Integration Health": { "main": [[{ "node": "Format Health Results", "type": "main", "index": 0 }]] },
+    "Format Health Results": { "main": [[{ "node": "Supabase — Upsert Connector Health", "type": "main", "index": 0 }]] },
+    "Supabase — Fetch Failed Deliveries": { "main": [[{ "node": "Prepare Delivery Retry", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1", "errorWorkflow": "error-handler" },
+  "tags": ["revos", "core", "ops"],
+  "meta": { "revos_version": "1.0.0", "description": "Every 15 min: validate license → if valid: health check connectors + write heartbeat + retry failed deliveries. If invalid: alert + stop." }
+}
