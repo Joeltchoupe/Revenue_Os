@@ -1,0 +1,345 @@
+{
+  "name": "00 \u2014 Supervisor Router",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "revos/event",
+        "responseMode": "onReceived"
+      },
+      "id": "webhook_ingest",
+      "name": "Webhook \u2014 Event Ingest",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        200,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const e = $input.first().json;\nconst payload = e.payload ? (typeof e.payload === 'string' ? JSON.parse(e.payload) : e.payload) : e;\nconst tenantId = payload.tenant_id || process.env.DEFAULT_TENANT_ID || '';\nif (!tenantId) throw new Error('No tenant_id in event payload');\nconst ROUTE_MAP = {\n  'new_lead':           '01-detect-score',\n  'cron_detect':        '01-detect-score',\n  'cron_treasury':      '05-treasury',\n  'cron_ads':           '04-ads',\n  'cron_brief':         '07-brief',\n  'deal_update':        '03-pipeline',\n  'cron_pipeline':      '03-pipeline',\n  'feedback_event':     '08-feedback',\n  'approval_action':    'approval-handler'\n};\nconst eventType = payload.event_type || 'unknown';\nconst target = ROUTE_MAP[eventType];\nif (!target) {\n  console.warn('Unhandled event type:', eventType);\n  return [{ json: { skipped: true, reason: `No route for event_type: ${eventType}` } }];\n}\nreturn [{ json: { ...payload, tenant_id: tenantId, _target: target, _routed_at: new Date().toISOString() } }];"
+      },
+      "id": "router",
+      "name": "Router \u2014 Classify Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "dataPropertyName": "json",
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{$json._target}}",
+              "operation": "startsWith",
+              "value2": "01"
+            }
+          ]
+        }
+      },
+      "id": "sw_lead",
+      "name": "\u2192 Lead Detection",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        640,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "dataPropertyName": "json",
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{$json._target}}",
+              "operation": "startsWith",
+              "value2": "05"
+            }
+          ]
+        }
+      },
+      "id": "sw_treasury",
+      "name": "\u2192 Treasury",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        640,
+        340
+      ]
+    },
+    {
+      "parameters": {
+        "dataPropertyName": "json",
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{$json._target}}",
+              "operation": "startsWith",
+              "value2": "07"
+            }
+          ]
+        }
+      },
+      "id": "sw_brief",
+      "name": "\u2192 Brief",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        640,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.WEBHOOK_URL}}/webhook/revos/01-detect-score",
+        "method": "POST",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "payload",
+              "value": "={{JSON.stringify($json)}}"
+            }
+          ]
+        }
+      },
+      "id": "trig_lead",
+      "name": "Trigger 01",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        860,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.WEBHOOK_URL}}/webhook/revos/05-treasury",
+        "method": "POST",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "payload",
+              "value": "={{JSON.stringify($json)}}"
+            }
+          ]
+        }
+      },
+      "id": "trig_treasury",
+      "name": "Trigger 05",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        860,
+        340
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.WEBHOOK_URL}}/webhook/revos/07-brief",
+        "method": "POST",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "payload",
+              "value": "={{JSON.stringify($json)}}"
+            }
+          ]
+        }
+      },
+      "id": "trig_brief",
+      "name": "Trigger 07",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        860,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 6 * * *"
+            }
+          ]
+        }
+      },
+      "id": "cron_detect",
+      "name": "Cron 06:00 Detect",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [
+        200,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * *"
+            }
+          ]
+        }
+      },
+      "id": "cron_treasury",
+      "name": "Cron 08:00 Treasury",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [
+        200,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * 1"
+            }
+          ]
+        }
+      },
+      "id": "cron_brief",
+      "name": "Cron Mon 09:00 Brief",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [
+        200,
+        640
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook \u2014 Event Ingest": {
+      "main": [
+        [
+          {
+            "node": "Router \u2014 Classify Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Router \u2014 Classify Event": {
+      "main": [
+        [
+          {
+            "node": "\u2192 Lead Detection",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "\u2192 Treasury",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "\u2192 Brief",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "\u2192 Lead Detection": {
+      "main": [
+        [
+          {
+            "node": "Trigger 01",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "\u2192 Treasury": {
+      "main": [
+        [
+          {
+            "node": "Trigger 05",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "\u2192 Brief": {
+      "main": [
+        [
+          {
+            "node": "Trigger 07",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cron 06:00 Detect": {
+      "main": [
+        [
+          {
+            "node": "Router \u2014 Classify Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cron 08:00 Treasury": {
+      "main": [
+        [
+          {
+            "node": "Router \u2014 Classify Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cron Mon 09:00 Brief": {
+      "main": [
+        [
+          {
+            "node": "Router \u2014 Classify Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "error-handler"
+  },
+  "tags": [
+    "revos",
+    "supervisor"
+  ],
+  "meta": {
+    "revos_version": "1.0.0",
+    "description": "Central event router. All events enter here."
+  }
+}
