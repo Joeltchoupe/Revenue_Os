@@ -1,0 +1,289 @@
+{
+  "name": "02 — Pipeline: Next-Best-Action, Stuck Deals, Unblock",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "revos/03-pipeline",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "wh_pipeline",
+      "name": "Webhook — Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [200, 300]
+    },
+    {
+      "parameters": {
+        "rule": { "interval": [{ "field": "cronExpression", "expression": "0 9 * * *" }] }
+      },
+      "id": "cron_pipeline",
+      "name": "Cron — Daily 09:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [200, 460]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT d.id, d.crm_id, d.name, d.stage, d.amount, d.probability,\n       d.close_date, d.last_activity_at, d.stage_entered_at,\n       d.days_in_stage, d.raw,\n       l.name as contact_name, l.email as contact_email, l.role as contact_role\nFROM deals d\nLEFT JOIN leads l ON l.crm_id = (d.raw->>'contact_crm_id') AND l.tenant_id = d.tenant_id\nWHERE d.tenant_id = '$(TENANT_ID)'\n  AND d.status = 'open'\nORDER BY d.days_in_stage DESC\nLIMIT 100;"
+      },
+      "id": "fetch_deals",
+      "name": "Supabase — Fetch Open Deals",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [440, 300],
+      "credentials": { "postgres": { "id": "supabase_pg", "name": "Supabase PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "// UC6: Detect stuck deals based on configurable thresholds\n// Thresholds can be overridden per-tenant in tenant_configs\nconst tenantId = $env.TENANT_ID;\n\n// Default stagnation thresholds by stage keyword (days)\n// These are conservative — real deal will vary by industry\nconst STAGE_THRESHOLDS = {\n  default: 10,\n  demo: 7,\n  proposal: 14,\n  contract: 7,\n  negotiation: 21,\n  discovery: 14,\n  qualified: 10,\n  trial: 14,\n  review: 10,\n};\n\nfunction getThreshold(stage) {\n  if (!stage) return STAGE_THRESHOLDS.default;\n  const s = stage.toLowerCase();\n  for (const [key, days] of Object.entries(STAGE_THRESHOLDS)) {\n    if (key !== 'default' && s.includes(key)) return days;\n  }\n  return STAGE_THRESHOLDS.default;\n}\n\nconst deals = $input.all().map(i => i.json);\n\nif (!deals || deals.length === 0) {\n  return [{ json: { skipped: true, reason: 'No open deals found', tenant_id: tenantId } }];\n}\n\nconst stuck = deals.filter(d => {\n  const threshold = getThreshold(d.stage);\n  const daysStuck = parseInt(d.days_in_stage) || 0;\n  return daysStuck >= threshold;\n});\n\nconsole.log(`[02-pipeline] ${deals.length} open deals, ${stuck.length} stuck`);\n\nif (stuck.length === 0) {\n  return [{ json: { skipped: true, reason: 'No stuck deals detected', total_deals: deals.length } }];\n}\n\n// Sort by value — biggest deals first\nstuck.sort((a, b) => parseFloat(b.amount || 0) - parseFloat(a.amount || 0));\n\n// Cap at 10 to avoid LLM cost explosion\nreturn stuck.slice(0, 10).map(d => ({ json: { ...d, _is_stuck: true } }));"
+      },
+      "id": "detect_stuck",
+      "name": "Detect Stuck Deals (UC6)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [660, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [{ "value1": "={{$json.skipped}}", "operation": "notEqual", "value2": true }]
+        }
+      },
+      "id": "has_stuck",
+      "name": "Any Stuck Deals?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [880, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT content, metadata FROM memory_chunks\nWHERE tenant_id = '$(TENANT_ID)'\n  AND metadata->>'type' = 'deal_unblock'\nORDER BY (metadata->>'outcome_score')::int DESC\nLIMIT 3;"
+      },
+      "id": "fetch_rag_deals",
+      "name": "Supabase — RAG Deal Patterns",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1100, 200],
+      "credentials": { "postgres": { "id": "supabase_pg", "name": "Supabase PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const deal = $('Detect Stuck Deals (UC6)').first().json;\nconst ragRows = $('Supabase — RAG Deal Patterns').all().map(i => i.json);\n\nconst ragExamples = ragRows.length > 0\n  ? ragRows.map((r, i) => {\n      const m = r.metadata || {};\n      return `Example ${i+1}: Stage=${m.stage || 'unknown'}, Action=${m.action || 'N/A'}, Outcome=${m.outcome_score || '?'}%`;\n    }).join('\\n')\n  : 'No past examples — use best judgment.';\n\nconst stageDays = parseInt(deal.days_in_stage) || 0;\nconst dealValue = parseFloat(deal.amount || 0).toLocaleString();\n\nconst prompt = `You are an expert sales analyst. A deal is stuck.\n\nDEAL DATA\nName: ${deal.name}\nStage: ${deal.stage}\nDays stuck in current stage: ${stageDays}\nDeal value: $${dealValue}\nClose probability: ${deal.probability}%\nContact: ${deal.contact_name || 'Unknown'} (${deal.contact_role || 'Unknown role'})\nLast activity: ${deal.last_activity_at || 'Unknown'}\n\nSIMILAR PAST UNBLOCKS\n${ragExamples}\n\nANALYZE AND OUTPUT STRICTLY in this format:\nDIAGNOSIS:\n[1-2 sentences — what is likely causing this deal to stall? Be specific.]\n\nBLOCKING_FACTOR: [TIMING|BUDGET|AUTHORITY|NEED|TRUST|COMPETITOR|UNKNOWN]\n\nACTION:\n[1 sentence — exact action: channel (email/call/LinkedIn) + specific hook or angle. Not 'follow up'.]\n\nRISK_IF_NO_ACTION:\n[1 sentence — what happens to this deal if nothing is done this week?]`;\n\nreturn [{ json: { ...deal, _unblock_prompt: prompt } }];"
+      },
+      "id": "build_unblock_prompt",
+      "name": "Build Unblock Prompt (UC7)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1320, 200]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "modelId": "claude-sonnet-4-6",
+        "messages": { "values": [{ "role": "user", "content": "={{$json._unblock_prompt}}" }] },
+        "options": { "maxTokens": 350, "temperature": 0.4 }
+      },
+      "id": "claude_unblock",
+      "name": "Claude — Analyze & Recommend Unblock",
+      "type": "@n8n/n8n-nodes-langchain.anthropic",
+      "typeVersion": 1,
+      "position": [1540, 200],
+      "credentials": { "anthropicApi": { "id": "anthropic_main", "name": "Revos Anthropic" } }
+    },
+    {
+      "parameters": {
+        "url": "={{$env.PYTHON_SERVICE_URL}}/validate/llm-output",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [{ "name": "x-service-key", "value": "={{$env.SERVICE_SECRET_KEY}}" }] },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "tenant_id", "value": "={{$env.TENANT_ID}}" },
+            { "name": "output_type", "value": "deal_analysis" },
+            { "name": "raw_output", "value": "={{$('Claude — Analyze & Recommend Unblock').first().json.content[0].text}}" }
+          ]
+        },
+        "options": { "response": { "response": { "neverError": true } } }
+      },
+      "id": "validate_unblock",
+      "name": "Python — Validate Unblock Output",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1760, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "const deal     = $('Build Unblock Prompt (UC7)').first().json;\nconst raw      = $('Claude — Analyze & Recommend Unblock').first().json.content?.[0]?.text || '';\nconst validated = $input.first().json;\n\nconst finalText = validated.valid ? validated.output : raw;\nconst warnings  = validated.warnings || [];\nif (!validated.valid) warnings.push('Validation failed — using raw LLM output, review before acting');\n\n// Extract structured fields\nconst diagMatch    = finalText.match(/DIAGNOSIS:\\s*([\\s\\S]*?)(?:BLOCKING_FACTOR:|$)/i);\nconst factorMatch  = finalText.match(/BLOCKING_FACTOR:\\s*(\\w+)/i);\nconst actionMatch  = finalText.match(/ACTION:\\s*([\\s\\S]*?)(?:RISK_IF_NO_ACTION:|$)/i);\nconst riskMatch    = finalText.match(/RISK_IF_NO_ACTION:\\s*([\\s\\S]*?)$/i);\n\nreturn [{\n  json: {\n    deal_id:         deal.id,\n    deal_name:       deal.name,\n    deal_amount:     deal.amount,\n    deal_stage:      deal.stage,\n    days_in_stage:   deal.days_in_stage,\n    contact_email:   deal.contact_email,\n    diagnosis:       diagMatch?.[1]?.trim() || 'Analysis unavailable',\n    blocking_factor: factorMatch?.[1]?.trim() || 'UNKNOWN',\n    action:          actionMatch?.[1]?.trim() || 'Manual review required',\n    risk:            riskMatch?.[1]?.trim() || '',\n    full_analysis:   finalText,\n    validation_warnings: warnings,\n    tenant_id:       $env.TENANT_ID\n  }\n}];"
+      },
+      "id": "parse_unblock",
+      "name": "Parse Unblock Analysis",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1980, 200]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "table": "recommendations",
+        "columns": "tenant_id,agent,rec_type,data,priority,status",
+        "additionalFields": {
+          "additionalFields": [
+            { "name": "tenant_id", "value": "={{$json.tenant_id}}" },
+            { "name": "agent", "value": "02_pipeline" },
+            { "name": "rec_type", "value": "stuck_deal_unblock" },
+            { "name": "data", "value": "={{JSON.stringify($json)}}" },
+            { "name": "priority", "value": "={{parseFloat($json.deal_amount) > 10000 ? 'HIGH' : 'MEDIUM'}}" },
+            { "name": "status", "value": "pending" }
+          ]
+        }
+      },
+      "id": "insert_rec",
+      "name": "Supabase — Store Recommendation",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [2200, 200],
+      "credentials": { "postgres": { "id": "supabase_pg", "name": "Supabase PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build next-best-action prompt (UC5) for all actionable leads\n// Runs in parallel to stuck deal analysis\nconst deals = $('Detect Stuck Deals (UC6)').all().map(i => i.json);\n\n// UC5 — generate NBA for top 3 stuck deals by value\nconst top3 = deals.slice(0, 3);\nreturn top3.map(d => ({\n  json: {\n    ...d,\n    _nba_prompt: `You are a senior sales strategist. For this deal, what is the single best action to take RIGHT NOW?\\n\\nDeal: ${d.name}\\nStage: ${d.stage}\\nDays stuck: ${d.days_in_stage}\\nValue: $${parseFloat(d.amount || 0).toLocaleString()}\\nContact: ${d.contact_name || 'Unknown'}\\n\\nOUTPUT strictly:\\nACTION_TYPE: [email|call|linkedin|meeting|proposal_revision|price_negotiation]\\nCHANNEL: [email|phone|linkedin|in_person]\\nMESSAGE_ANGLE: [1 sentence — the hook or angle to use]\\nURGENCY: [HIGH|MEDIUM|LOW]\\nRATIONALE: [1 sentence — why this specific action now]`\n  }\n}));"
+      },
+      "id": "build_nba_prompt",
+      "name": "Build NBA Prompt (UC5)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 400]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "modelId": "claude-sonnet-4-6",
+        "messages": { "values": [{ "role": "user", "content": "={{$json._nba_prompt}}" }] },
+        "options": { "maxTokens": 250, "temperature": 0.3 }
+      },
+      "id": "claude_nba",
+      "name": "Claude — Next Best Action",
+      "type": "@n8n/n8n-nodes-langchain.anthropic",
+      "typeVersion": 1,
+      "position": [1320, 400],
+      "credentials": { "anthropicApi": { "id": "anthropic_main", "name": "Revos Anthropic" } }
+    },
+    {
+      "parameters": {
+        "url": "={{$env.PYTHON_SERVICE_URL}}/validate/llm-output",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [{ "name": "x-service-key", "value": "={{$env.SERVICE_SECRET_KEY}}" }] },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "tenant_id", "value": "={{$env.TENANT_ID}}" },
+            { "name": "output_type", "value": "next_best_action" },
+            { "name": "raw_output", "value": "={{$('Claude — Next Best Action').first().json.content[0].text}}" }
+          ]
+        },
+        "options": { "response": { "response": { "neverError": true } } }
+      },
+      "id": "validate_nba",
+      "name": "Python — Validate NBA",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1540, 400]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "table": "recommendations",
+        "additionalFields": {
+          "additionalFields": [
+            { "name": "tenant_id", "value": "={{$env.TENANT_ID}}" },
+            { "name": "agent", "value": "02_pipeline_nba" },
+            { "name": "rec_type", "value": "next_best_action" },
+            { "name": "data", "value": "={\"deal_id\": \"{{$('Build NBA Prompt (UC5)').first().json.id}}\", \"deal_name\": \"{{$('Build NBA Prompt (UC5)').first().json.name}}\", \"analysis\": \"{{$('Python — Validate NBA').first().json.output}}\"}" },
+            { "name": "priority", "value": "MEDIUM" },
+            { "name": "status", "value": "pending" }
+          ]
+        }
+      },
+      "id": "insert_nba",
+      "name": "Supabase — Store NBA Recommendation",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1760, 400],
+      "credentials": { "postgres": { "id": "supabase_pg", "name": "Supabase PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "operation": "aggregateItems",
+        "fieldsToAggregate": {
+          "fieldToAggregate": [
+            { "fieldToAggregate": "deal_name" },
+            { "fieldToAggregate": "days_in_stage" },
+            { "fieldToAggregate": "deal_amount" },
+            { "fieldToAggregate": "blocking_factor" },
+            { "fieldToAggregate": "action" }
+          ]
+        }
+      },
+      "id": "aggregate_alerts",
+      "name": "Aggregate Pipeline Alerts",
+      "type": "n8n-nodes-base.aggregate",
+      "typeVersion": 1,
+      "position": [2420, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\nconst names   = data.deal_name || [];\nconst days    = data.days_in_stage || [];\nconst amounts = data.deal_amount || [];\nconst factors = data.blocking_factor || [];\nconst actions = data.action || [];\n\nif (names.length === 0) {\n  return [{ json: { slack_message: '✅ Pipeline looks healthy — no stuck deals today.' } }];\n}\n\nconst lines = names.map((n, i) =>\n  `*${n}* — ${days[i]} days stuck · $${parseFloat(amounts[i] || 0).toLocaleString()}\\n  🔍 ${factors[i] || 'UNKNOWN'} · ${actions[i] || 'Review manually'}`);\n\nconst msg = `🚨 *Pipeline Alert — ${names.length} stuck deal(s)*\\n\\n${lines.join('\\n\\n')}\\n\\n_Review the approval queue in your dashboard._`;\nreturn [{ json: { slack_message: msg } }];"
+      },
+      "id": "build_pipeline_slack",
+      "name": "Build Pipeline Slack Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2640, 200]
+    },
+    {
+      "parameters": {
+        "webhookUrl": "={{$env.SLACK_WEBHOOK_URL}}",
+        "text": "={{$json.slack_message}}"
+      },
+      "id": "slack_pipeline",
+      "name": "Slack — Pipeline Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 1,
+      "position": [2860, 200],
+      "credentials": { "slackApi": { "id": "slack_main", "name": "Revos Slack" } }
+    }
+  ],
+  "connections": {
+    "Webhook — Trigger": { "main": [[{ "node": "Supabase — Fetch Open Deals", "type": "main", "index": 0 }]] },
+    "Cron — Daily 09:00":   { "main": [[{ "node": "Supabase — Fetch Open Deals", "type": "main", "index": 0 }]] },
+    "Supabase — Fetch Open Deals": { "main": [[{ "node": "Detect Stuck Deals (UC6)", "type": "main", "index": 0 }]] },
+    "Detect Stuck Deals (UC6)": { "main": [[{ "node": "Any Stuck Deals?", "type": "main", "index": 0 }]] },
+    "Any Stuck Deals?": { "main": [
+      [{ "node": "Supabase — RAG Deal Patterns", "type": "main", "index": 0 }],
+      []
+    ]},
+    "Supabase — RAG Deal Patterns": { "main": [[{ "node": "Build Unblock Prompt (UC7)", "type": "main", "index": 0 }], [{ "node": "Build NBA Prompt (UC5)", "type": "main", "index": 0 }]] },
+    "Build Unblock Prompt (UC7)": { "main": [[{ "node": "Claude — Analyze & Recommend Unblock", "type": "main", "index": 0 }]] },
+    "Claude — Analyze & Recommend Unblock": { "main": [[{ "node": "Python — Validate Unblock Output", "type": "main", "index": 0 }]] },
+    "Python — Validate Unblock Output": { "main": [[{ "node": "Parse Unblock Analysis", "type": "main", "index": 0 }]] },
+    "Parse Unblock Analysis": { "main": [[{ "node": "Supabase — Store Recommendation", "type": "main", "index": 0 }]] },
+    "Supabase — Store Recommendation": { "main": [[{ "node": "Aggregate Pipeline Alerts", "type": "main", "index": 0 }]] },
+    "Aggregate Pipeline Alerts": { "main": [[{ "node": "Build Pipeline Slack Message", "type": "main", "index": 0 }]] },
+    "Build Pipeline Slack Message": { "main": [[{ "node": "Slack — Pipeline Alert", "type": "main", "index": 0 }]] },
+    "Build NBA Prompt (UC5)": { "main": [[{ "node": "Claude — Next Best Action", "type": "main", "index": 0 }]] },
+    "Claude — Next Best Action": { "main": [[{ "node": "Python — Validate NBA", "type": "main", "index": 0 }]] },
+    "Python — Validate NBA": { "main": [[{ "node": "Supabase — Store NBA Recommendation", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1", "errorWorkflow": "error-handler" },
+  "tags": ["revos", "revenue", "pipeline"],
+  "meta": { "revos_version": "1.0.0", "description": "UC5 NBA + UC6 detect stuck + UC7 unblock recommendation. Claude analyzes, Python validates, Supabase stores, Slack delivers." }
+}

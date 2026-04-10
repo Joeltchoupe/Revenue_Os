@@ -1,0 +1,172 @@
+{
+  "name": "01 — Lead Detection, Scoring & Email Generation",
+  "nodes": [
+    {
+      "parameters": { "httpMethod": "POST", "path": "revos/01-detect-score", "responseMode": "onReceived" },
+      "id": "wh_01", "name": "Webhook — Trigger",
+      "type": "n8n-nodes-base.webhook", "typeVersion": 1, "position": [200, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- UC1: Dormant leads never contacted\nSELECT id, name, email, company, role, industry, company_size, notes, score, routing, last_activity_at, created_at\nFROM leads\nWHERE tenant_id = '{{$env.TENANT_ID}}'\n  AND status = 'new'\n  AND (last_activity_at IS NULL OR last_activity_at < NOW() - INTERVAL '30 days')\n  AND created_at < NOW() - INTERVAL '7 days'\nORDER BY score DESC\nLIMIT 50;"
+      },
+      "id": "fetch_dormant", "name": "Supabase — Dormant Leads (UC1)",
+      "type": "n8n-nodes-base.postgres", "typeVersion": 2, "position": [420, 200],
+      "credentials": { "postgres": { "id": "supabase_pg", "name": "Supabase PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- UC2: Post-demo leads with no follow-up\nSELECT l.id, l.name, l.email, l.company, l.role, l.industry, l.company_size, l.notes, l.score,\n       l.routing, l.last_activity_at\nFROM leads l\nLEFT JOIN emails_sent e ON e.lead_id = l.id AND e.tenant_id = l.tenant_id\nWHERE l.tenant_id = '{{$env.TENANT_ID}}'\n  AND l.status IN ('new', 'contacted')\n  AND (l.last_activity_at < NOW() - INTERVAL '14 days' OR l.last_activity_at IS NULL)\n  AND e.id IS NULL\nORDER BY l.score DESC\nLIMIT 50;"
+      },
+      "id": "fetch_postdemo", "name": "Supabase — Post-Demo No Follow-Up (UC2)",
+      "type": "n8n-nodes-base.postgres", "typeVersion": 2, "position": [420, 380],
+      "credentials": { "postgres": { "id": "supabase_pg", "name": "Supabase PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge dormant + post-demo, deduplicate by email, attach type\nconst dormant  = $('Supabase — Dormant Leads (UC1)').all().map(i => ({ ...i.json, detection_type: 'dormant' }));\nconst postdemo = $('Supabase — Post-Demo No Follow-Up (UC2)').all().map(i => ({ ...i.json, detection_type: 'post_demo' }));\nconst seen = new Set();\nconst merged = [...dormant, ...postdemo].filter(lead => {\n  if (!lead.email || seen.has(lead.email)) return false;\n  seen.add(lead.email);\n  return true;\n});\nconsole.log(`[01] Detected ${merged.length} leads to process (${dormant.length} dormant, ${postdemo.length} post-demo)`);\nif (merged.length === 0) return [{ json: { skipped: true, reason: 'No leads to process' } }];\nreturn merged.map(l => ({ json: l }));"
+      },
+      "id": "merge_leads", "name": "Merge & Deduplicate Leads",
+      "type": "n8n-nodes-base.code", "typeVersion": 2, "position": [640, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.PYTHON_SERVICE_URL}}/leads/score",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [{ "name": "x-service-key", "value": "={{$env.SERVICE_SECRET_KEY}}" }] },
+        "sendBody": true,
+        "bodyParameters": { "parameters": [{ "name": "tenant_id", "value": "={{$env.TENANT_ID}}" }, { "name": "lead", "value": "={{JSON.stringify($json)}}" }] },
+        "options": { "response": { "response": { "neverError": true } } }
+      },
+      "id": "score_lead", "name": "Python — Score Lead (UC3)",
+      "type": "n8n-nodes-base.httpRequest", "typeVersion": 4, "position": [860, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge score result back into lead\nconst lead  = $('Merge & Deduplicate Leads').first().json;\nconst score = $input.first().json;\nif (score.error) {\n  console.warn('Score API failed — using raw lead score:', lead.score);\n  return [{ json: { ...lead, score: lead.score || 0, routing: lead.routing || 'cold', score_breakdown: {} } }];\n}\nreturn [{ json: { ...lead, score: score.score, routing: score.routing, score_breakdown: score.breakdown } }];"
+      },
+      "id": "merge_score", "name": "Merge Score Result",
+      "type": "n8n-nodes-base.code", "typeVersion": 2, "position": [1080, 300]
+    },
+    {
+      "parameters": {
+        "conditions": { "number": [{ "value1": "={{$json.score}}", "operation": "largerEqual", "value2": 60 }] }
+      },
+      "id": "filter_actionable", "name": "Score >= 60?",
+      "type": "n8n-nodes-base.if", "typeVersion": 1, "position": [1280, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=SELECT content, metadata FROM memory_chunks WHERE tenant_id = '{{$env.TENANT_ID}}' AND metadata->>'type' = 'successful_email' ORDER BY created_at DESC LIMIT 3;"
+      },
+      "id": "fetch_rag", "name": "Supabase — Fetch RAG Patterns",
+      "type": "n8n-nodes-base.postgres", "typeVersion": 2, "position": [1500, 200],
+      "credentials": { "postgres": { "id": "supabase_pg", "name": "Supabase PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const lead = $('Merge Score Result').first().json;\nconst ragRows = $('Supabase — Fetch RAG Patterns').all().map(i => i.json);\nconst ragExamples = ragRows.map((r, i) => {\n  const m = r.metadata || {};\n  return `Example ${i+1}:\\nSubject: ${m.subject || 'N/A'}\\nBody: ${m.body || 'N/A'}\\nOutcome: ${m.outcome_score || '?'}% success rate`;\n}).join('\\n\\n') || 'No past examples yet — use best judgment.';\nconst prompt = `You are a senior B2B sales strategist. Write ONE cold re-engagement email for a lead who went silent.\\n\\nLEAD CONTEXT\\nName: ${lead.name}\\nRole: ${lead.role || 'unknown'}\\nCompany: ${lead.company}\\nIndustry: ${lead.industry || 'unknown'}\\nCompany size: ${lead.company_size || 'unknown'} employees\\nWhy we're reaching out: ${lead.detection_type === 'dormant' ? 'Never followed up after initial contact' : 'No activity since demo'}\\nNotes: ${lead.notes || 'none'}\\n\\nSUCCESSFUL EMAIL PATTERNS (for reference — do not copy verbatim)\\n${ragExamples}\\n\\nRULES\\n- Max 80 words in body\\n- Subject: max 8 words, no emoji, no exclamation\\n- No filler openers (no 'I hope this finds you well')\\n- No spam words (synergy, game-changer, leverage)\\n- End with ONE low-pressure question CTA\\n- Tone: direct, warm, peer-to-peer\\n\\nOUTPUT FORMAT (strictly):\\nSubject: [subject line]\\n\\n[email body]`;\nreturn [{ json: { ...lead, _email_prompt: prompt } }];"
+      },
+      "id": "build_email_prompt", "name": "Build Email Prompt (UC4)",
+      "type": "n8n-nodes-base.code", "typeVersion": 2, "position": [1700, 200]
+    },
+    {
+      "parameters": {
+        "resource": "message", "operation": "sendMessage",
+        "modelId": "claude-sonnet-4-6",
+        "messages": { "values": [{ "role": "user", "content": "={{$json._email_prompt}}" }] },
+        "options": { "maxTokens": 400, "temperature": 0.7 }
+      },
+      "id": "claude_email", "name": "Claude — Generate Email",
+      "type": "@n8n/n8n-nodes-langchain.anthropic", "typeVersion": 1, "position": [1920, 200],
+      "credentials": { "anthropicApi": { "id": "anthropic_main", "name": "Revos Anthropic" } }
+    },
+    {
+      "parameters": {
+        "url": "={{$env.PYTHON_SERVICE_URL}}/validate/llm-output",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [{ "name": "x-service-key", "value": "={{$env.SERVICE_SECRET_KEY}}" }] },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "tenant_id", "value": "={{$env.TENANT_ID}}" },
+            { "name": "output_type", "value": "email" },
+            { "name": "raw_output", "value": "={{$('Claude — Generate Email').first().json.content[0].text}}" },
+            { "name": "context", "value": "={\"name\": \"{{$('Build Email Prompt (UC4)').first().json.name}}\"}" }
+          ]
+        },
+        "options": { "response": { "response": { "neverError": true } } }
+      },
+      "id": "validate_email", "name": "Python — Validate Email Output",
+      "type": "n8n-nodes-base.httpRequest", "typeVersion": 4, "position": [2140, 200]
+    },
+    {
+      "parameters": {
+        "conditions": { "boolean": [{ "value1": "={{$json.valid}}", "value2": true }] }
+      },
+      "id": "email_valid_check", "name": "Email Valid?",
+      "type": "n8n-nodes-base.if", "typeVersion": 1, "position": [2340, 200]
+    },
+    {
+      "parameters": {
+        "operation": "insert", "table": "recommendations",
+        "columns": "tenant_id, agent, rec_type, data, priority, status",
+        "additionalFields": {}
+      },
+      "id": "insert_rec_email", "name": "Supabase — Insert Email Recommendation",
+      "type": "n8n-nodes-base.postgres", "typeVersion": 2, "position": [2560, 100],
+      "credentials": { "postgres": { "id": "supabase_pg", "name": "Supabase PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "operation": "insert", "table": "recommendations",
+        "columns": "tenant_id, agent, rec_type, data, priority, status",
+        "additionalFields": {}
+      },
+      "id": "insert_rec_invalid", "name": "Supabase — Insert Flagged (validation failed)",
+      "type": "n8n-nodes-base.postgres", "typeVersion": 2, "position": [2560, 320],
+      "credentials": { "postgres": { "id": "supabase_pg", "name": "Supabase PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "conditions": { "string": [{ "value1": "={{$env.EXECUTION_MODE}}", "operation": "equal", "value2": "auto" }] }
+      },
+      "id": "auto_or_approval", "name": "Auto or Approval?",
+      "type": "n8n-nodes-base.if", "typeVersion": 1, "position": [2760, 100]
+    },
+    {
+      "parameters": {
+        "webhookUrl": "={{$env.SLACK_WEBHOOK_URL}}",
+        "text": "=📧 *Email Draft — Approval Required*\n\n*To:* {{$('Build Email Prompt (UC4)').first().json.name}} <{{$('Build Email Prompt (UC4)').first().json.email}}>\n*Company:* {{$('Build Email Prompt (UC4)').first().json.company}}\n*Score:* {{$('Build Email Prompt (UC4)').first().json.score}}/100\n*Type:* {{$('Build Email Prompt (UC4)').first().json.detection_type}}\n\n*Email:*\n```\n{{$('Python — Validate Email Output').first().json.output}}\n```"
+      },
+      "id": "slack_approval", "name": "Slack — Send for Approval (UC10)",
+      "type": "n8n-nodes-base.slack", "typeVersion": 1, "position": [2960, 200],
+      "credentials": { "slackApi": { "id": "slack_main", "name": "Revos Slack" } }
+    }
+  ],
+  "connections": {
+    "Webhook — Trigger": { "main": [[{ "node": "Supabase — Dormant Leads (UC1)", "type": "main", "index": 0 }], [{ "node": "Supabase — Post-Demo No Follow-Up (UC2)", "type": "main", "index": 0 }]] },
+    "Supabase — Dormant Leads (UC1)": { "main": [[{ "node": "Merge & Deduplicate Leads", "type": "main", "index": 0 }]] },
+    "Supabase — Post-Demo No Follow-Up (UC2)": { "main": [[{ "node": "Merge & Deduplicate Leads", "type": "main", "index": 0 }]] },
+    "Merge & Deduplicate Leads": { "main": [[{ "node": "Python — Score Lead (UC3)", "type": "main", "index": 0 }]] },
+    "Python — Score Lead (UC3)": { "main": [[{ "node": "Merge Score Result", "type": "main", "index": 0 }]] },
+    "Merge Score Result": { "main": [[{ "node": "Score >= 60?", "type": "main", "index": 0 }]] },
+    "Score >= 60?": { "main": [[{ "node": "Supabase — Fetch RAG Patterns", "type": "main", "index": 0 }]] },
+    "Supabase — Fetch RAG Patterns": { "main": [[{ "node": "Build Email Prompt (UC4)", "type": "main", "index": 0 }]] },
+    "Build Email Prompt (UC4)": { "main": [[{ "node": "Claude — Generate Email", "type": "main", "index": 0 }]] },
+    "Claude — Generate Email": { "main": [[{ "node": "Python — Validate Email Output", "type": "main", "index": 0 }]] },
+    "Python — Validate Email Output": { "main": [[{ "node": "Email Valid?", "type": "main", "index": 0 }]] },
+    "Email Valid?": { "main": [[{ "node": "Supabase — Insert Email Recommendation", "type": "main", "index": 0 }], [{ "node": "Supabase — Insert Flagged (validation failed)", "type": "main", "index": 0 }]] },
+    "Supabase — Insert Email Recommendation": { "main": [[{ "node": "Auto or Approval?", "type": "main", "index": 0 }]] },
+    "Auto or Approval?": { "main": [[{ "node": "Slack — Send for Approval (UC10)", "type": "main", "index": 0 }], [{ "node": "Slack — Send for Approval (UC10)", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1", "errorWorkflow": "error-handler" },
+  "tags": ["revos", "revenue"],
+  "meta": { "revos_version": "1.0.0", "description": "UC1-UC4: detect dormant/post-demo leads, score, generate email, validate, route to approval or auto-send." }
+}
