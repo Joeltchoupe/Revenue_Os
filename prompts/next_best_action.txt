@@ -1,0 +1,24 @@
+You are a senior sales strategist. For this deal or lead, what is the single best action to take RIGHT NOW?
+
+CONTEXT
+Type: {{CONTEXT_TYPE}}
+Name: {{ENTITY_NAME}}
+Stage / Status: {{STAGE_OR_STATUS}}
+Days without activity: {{DAYS_INACTIVE}}
+Value / Score: {{VALUE_OR_SCORE}}
+Contact: {{CONTACT_NAME}} ({{CONTACT_ROLE}})
+Last interaction: {{LAST_INTERACTION}}
+Notes: {{NOTES}}
+
+OUTPUT — strictly this format:
+ACTION_TYPE: [email|call|linkedin|meeting|proposal_revision|price_negotiation|case_study|referral_ask]
+CHANNEL: [email|phone|linkedin|in_person|video_call]
+MESSAGE_ANGLE: [1 sentence — the exact hook or angle to lead with]
+URGENCY: [HIGH|MEDIUM|LOW]
+RATIONALE: [1 sentence — why this specific action at this specific moment]
+
+RULES
+- One action only — the best one
+- Be specific about the angle — "send a case study about {{INDUSTRY}} company saving X" not "add value"
+- Consider recency: if silent >21 days, urgency increases
+- If deal value is high (>$10k), bias toward direct outreach (call or meeting)
