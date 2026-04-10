@@ -1,0 +1,185 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Revenue OS — Canonical Response Models v1",
+  "description": "Stable contracts between backend and all delivery surfaces (Lovable UI, Slack, Email). Never expose raw DB rows. All surfaces render from these shapes.",
+  "version": "1.0.0",
+
+  "definitions": {
+
+    "Alert": {
+      "description": "A time-sensitive signal requiring immediate attention (CRITICAL or WARNING).",
+      "type": "object",
+      "required": ["id","tenant_id","level","domain","title","body","created_at","delivery_status"],
+      "properties": {
+        "id":              { "type": "string", "format": "uuid" },
+        "tenant_id":       { "type": "string", "format": "uuid" },
+        "correlation_id":  { "type": "string" },
+        "level":           { "type": "string", "enum": ["CRITICAL","WARNING","INFO"] },
+        "domain":          { "type": "string", "enum": ["TREASURY","PIPELINE","LEADS","SPEND","SYSTEM"] },
+        "title":           { "type": "string", "maxLength": 120 },
+        "body":            { "type": "string", "maxLength": 600 },
+        "why_recommended": { "type": "string", "maxLength": 200 },
+        "estimated_impact":{ "type": "string", "maxLength": 100, "examples": ["saves ~$800/mo", "+1.2 months runway"] },
+        "created_at":      { "type": "string", "format": "date-time" },
+        "delivery_status": { "type": "string", "enum": ["pending","delivered","failed","suppressed","snoozed"] },
+        "snooze_until":    { "type": ["string","null"], "format": "date-time" },
+        "cta": {
+          "type": "object",
+          "properties": {
+            "label": { "type": "string" },
+            "url":   { "type": "string" }
+          }
+        }
+      }
+    },
+
+    "Opportunity": {
+      "description": "A revenue or growth opportunity identified by the system.",
+      "type": "object",
+      "required": ["id","tenant_id","type","title","body","created_at","status"],
+      "properties": {
+        "id":              { "type": "string", "format": "uuid" },
+        "tenant_id":       { "type": "string", "format": "uuid" },
+        "correlation_id":  { "type": "string" },
+        "type":            { "type": "string", "enum": ["dormant_lead","post_demo","stuck_deal","ad_opportunity","next_best_action"] },
+        "title":           { "type": "string", "maxLength": 120 },
+        "body":            { "type": "string", "maxLength": 600 },
+        "why_recommended": { "type": "string", "maxLength": 200 },
+        "estimated_impact":{ "type": "string", "maxLength": 100 },
+        "entity": {
+          "type": "object",
+          "description": "The lead or deal this opportunity is about",
+          "properties": {
+            "type":    { "type": "string", "enum": ["lead","deal"] },
+            "id":      { "type": "string" },
+            "name":    { "type": "string" },
+            "company": { "type": "string" },
+            "value":   { "type": "number" }
+          }
+        },
+        "status":          { "type": "string", "enum": ["pending","approved","rejected","snoozed","executed","expired"] },
+        "delivery_status": { "type": "string", "enum": ["pending","delivered","failed","suppressed","snoozed"] },
+        "snooze_until":    { "type": ["string","null"], "format": "date-time" },
+        "created_at":      { "type": "string", "format": "date-time" },
+        "first_viewed_at": { "type": ["string","null"], "format": "date-time" },
+        "first_acted_at":  { "type": ["string","null"], "format": "date-time" }
+      }
+    },
+
+    "ApprovalItem": {
+      "description": "An action awaiting human approval. Always tied to a Recommendation.",
+      "type": "object",
+      "required": ["id","tenant_id","recommendation_id","action_type","payload","status","expires_at","created_at"],
+      "properties": {
+        "id":                  { "type": "string", "format": "uuid" },
+        "tenant_id":           { "type": "string", "format": "uuid" },
+        "recommendation_id":   { "type": "string", "format": "uuid" },
+        "correlation_id":      { "type": "string" },
+        "action_type":         { "type": "string", "enum": ["send_email","create_crm_task","log_crm_note","slack_notify","update_deal_stage"] },
+        "action_label":        { "type": "string", "maxLength": 80, "description": "Human-readable: 'Send re-engagement email to Alice'" },
+        "payload_preview":     { "type": "string", "maxLength": 400, "description": "Safe preview of what will happen (never raw payload with PII exposed to UI)" },
+        "estimated_impact":    { "type": "string", "maxLength": 100 },
+        "status":              { "type": "string", "enum": ["pending","approved","rejected","snoozed","expired"] },
+        "execution_status":    { "type": "string", "enum": ["not_started","running","succeeded","failed","skipped"] },
+        "expires_at":          { "type": "string", "format": "date-time" },
+        "snooze_until":        { "type": ["string","null"], "format": "date-time" },
+        "actioned_at":         { "type": ["string","null"], "format": "date-time" },
+        "channel":             { "type": "string", "enum": ["slack","email","ui"] },
+        "created_at":          { "type": "string", "format": "date-time" }
+      }
+    },
+
+    "BriefItem": {
+      "description": "A weekly executive brief snapshot.",
+      "type": "object",
+      "required": ["id","tenant_id","brief_text","week_start","created_at","delivery_status"],
+      "properties": {
+        "id":              { "type": "string", "format": "uuid" },
+        "tenant_id":       { "type": "string", "format": "uuid" },
+        "correlation_id":  { "type": "string" },
+        "brief_text":      { "type": "string" },
+        "week_start":      { "type": "string", "format": "date" },
+        "key_metrics": {
+          "type": "object",
+          "properties": {
+            "runway_months":  { "type": "number" },
+            "alert_level":    { "type": "string" },
+            "new_leads":      { "type": "integer" },
+            "stuck_deals":    { "type": "integer" },
+            "rec_critical":   { "type": "integer" },
+            "rec_high":       { "type": "integer" }
+          }
+        },
+        "delivery_status":  { "type": "string", "enum": ["pending","delivered","failed"] },
+        "delivery_channel": { "type": "string" },
+        "delivered_at":     { "type": ["string","null"], "format": "date-time" },
+        "first_viewed_at":  { "type": ["string","null"], "format": "date-time" },
+        "created_at":       { "type": "string", "format": "date-time" }
+      }
+    },
+
+    "TreasuryStatus": {
+      "description": "Current treasury health — safe to expose to UI dashboard.",
+      "type": "object",
+      "required": ["tenant_id","cash","burn_rate","runway_months","alert_level","safe_budget","currency","calculated_at"],
+      "properties": {
+        "tenant_id":          { "type": "string", "format": "uuid" },
+        "correlation_id":     { "type": "string" },
+        "cash":               { "type": "number" },
+        "burn_rate":          { "type": "number" },
+        "projected_revenue":  { "type": "number" },
+        "runway_months":      { "type": "number" },
+        "alert_level":        { "type": "string", "enum": ["HEALTHY","WARNING","CRITICAL"] },
+        "safe_budget":        { "type": "number" },
+        "currency":           { "type": "string", "maxLength": 3 },
+        "data_freshness":     { "type": "string", "enum": ["live","stale","manual"] },
+        "warnings":           { "type": "array", "items": { "type": "string" } },
+        "calculated_at":      { "type": "string", "format": "date-time" }
+      }
+    },
+
+    "SystemState": {
+      "description": "Lightweight system health summary for the UI header/sidebar.",
+      "type": "object",
+      "properties": {
+        "tenant_id":           { "type": "string" },
+        "pending_approvals":   { "type": "integer" },
+        "critical_alerts":     { "type": "integer" },
+        "connector_health": {
+          "type": "object",
+          "additionalProperties": { "type": "string", "enum": ["healthy","degraded","down","unconfigured"] }
+        },
+        "execution_mode":      { "type": "string", "enum": ["approval","auto"] },
+        "last_signal_at":      { "type": ["string","null"], "format": "date-time" },
+        "weekly_action_rate":  { "type": ["number","null"], "description": "0.0–1.0, approvals actioned / approvals sent" }
+      }
+    },
+
+    "PaginatedResponse": {
+      "type": "object",
+      "required": ["data","meta"],
+      "properties": {
+        "data": { "type": "array" },
+        "meta": {
+          "type": "object",
+          "properties": {
+            "total":   { "type": "integer" },
+            "page":    { "type": "integer" },
+            "limit":   { "type": "integer" },
+            "has_more":{ "type": "boolean" }
+          }
+        }
+      }
+    },
+
+    "ErrorResponse": {
+      "type": "object",
+      "required": ["error","code"],
+      "properties": {
+        "error":   { "type": "string" },
+        "code":    { "type": "string", "examples": ["NOT_FOUND","UNAUTHORIZED","QUOTA_EXCEEDED","APPROVAL_EXPIRED","ALREADY_ACTIONED"] },
+        "details": { "type": "object" }
+      }
+    }
+  }
+}
