@@ -1,0 +1,197 @@
+{
+  "name": "04 — Executive Brief (UC8 + UC9)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "revos/07-brief",
+        "responseMode": "onReceived"
+      },
+      "id": "wh_brief",
+      "name": "Webhook — Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [200, 300]
+    },
+    {
+      "parameters": {
+        "rule": { "interval": [{ "field": "cronExpression", "expression": "0 9 * * 1" }] }
+      },
+      "id": "cron_brief",
+      "name": "Cron — Monday 09:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [200, 460]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, agent, rec_type, data, priority, status, created_at\nFROM recommendations\nWHERE tenant_id = '$(TENANT_ID)'\n  AND created_at >= NOW() - INTERVAL '7 days'\n  AND status IN ('pending', 'approved', 'executed')\nORDER BY CASE priority WHEN 'CRITICAL' THEN 1 WHEN 'HIGH' THEN 2 WHEN 'MEDIUM' THEN 3 ELSE 4 END,\n         created_at DESC\nLIMIT 30;"
+      },
+      "id": "fetch_recs",
+      "name": "Supabase — Week Recommendations",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [440, 200],
+      "credentials": { "postgres": { "id": "supabase_pg", "name": "Supabase PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT cash, burn_rate, runway_months, alert_level, safe_budget, currency, calculated_at, warnings\nFROM treasury_snapshots\nWHERE tenant_id = '$(TENANT_ID)'\nORDER BY calculated_at DESC\nLIMIT 1;"
+      },
+      "id": "fetch_treasury",
+      "name": "Supabase — Latest Treasury",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [440, 360],
+      "credentials": { "postgres": { "id": "supabase_pg", "name": "Supabase PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  COUNT(*) as total_leads,\n  COUNT(*) FILTER (WHERE routing = 'hot') as hot_leads,\n  COUNT(*) FILTER (WHERE routing = 'warm') as warm_leads,\n  COUNT(*) FILTER (WHERE status = 'replied') as replied_leads\nFROM leads\nWHERE tenant_id = '$(TENANT_ID)'\n  AND created_at >= NOW() - INTERVAL '7 days';"
+      },
+      "id": "fetch_lead_stats",
+      "name": "Supabase — Lead Stats",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [440, 520],
+      "credentials": { "postgres": { "id": "supabase_pg", "name": "Supabase PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT COUNT(*) as stuck_count, SUM(amount) as stuck_value\nFROM deals\nWHERE tenant_id = '$(TENANT_ID)'\n  AND status = 'open'\n  AND days_in_stage >= 10;"
+      },
+      "id": "fetch_deal_stats",
+      "name": "Supabase — Deal Stats",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [440, 680],
+      "credentials": { "postgres": { "id": "supabase_pg", "name": "Supabase PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT content, metadata FROM memory_chunks\nWHERE tenant_id = '$(TENANT_ID)'\n  AND metadata->>'type' = 'brief_pattern'\nORDER BY (metadata->>'outcome_score')::int DESC NULLS LAST\nLIMIT 2;"
+      },
+      "id": "fetch_rag_brief",
+      "name": "Supabase — Brief RAG Patterns",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [440, 840],
+      "credentials": { "postgres": { "id": "supabase_pg", "name": "Supabase PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const recs       = $('Supabase — Week Recommendations').all().map(i => i.json);\nconst treasury   = $('Supabase — Latest Treasury').first().json || {};\nconst leadStats  = $('Supabase — Lead Stats').first().json || {};\nconst dealStats  = $('Supabase — Deal Stats').first().json || {};\nconst ragRows    = $('Supabase — Brief RAG Patterns').all().map(i => i.json);\n\nconst currency = treasury.currency || 'USD';\nconst fmt = n => parseFloat(n || 0).toLocaleString('en-US', { maximumFractionDigits: 0 });\n\n// Group recs by priority\nconst critical = recs.filter(r => r.priority === 'CRITICAL');\nconst high     = recs.filter(r => r.priority === 'HIGH');\nconst medium   = recs.filter(r => r.priority === 'MEDIUM');\n\nconst formatRec = r => {\n  let data = {};\n  try { data = typeof r.data === 'string' ? JSON.parse(r.data) : r.data || {}; } catch(e) {}\n  const summary = data.action || data.explanation || data.recommendation || data.full_analysis || JSON.stringify(data).substring(0, 150);\n  return `[${r.agent}/${r.rec_type}] ${summary}`;\n};\n\nconst ragExamples = ragRows.map((r, i) => {\n  const m = r.metadata || {};\n  return `Style example ${i+1} (well-received brief):\\n${r.content?.substring(0, 300) || 'N/A'}`;\n}).join('\\n\\n') || 'No past brief examples yet.';\n\nconst weekStart = new Date();\nweekStart.setDate(weekStart.getDate() - 6);\n\nconst context = [\n  `=== BRIEF PERIOD: ${weekStart.toDateString()} – ${new Date().toDateString()} ===`,\n  '',\n  '=== TREASURY ===',\n  `Runway: ${treasury.runway_months || 'N/A'} months (${treasury.alert_level || 'UNKNOWN'})`,\n  `Cash: ${currency} ${fmt(treasury.cash)}  |  Burn: ${currency} ${fmt(treasury.burn_rate)}/mo`,\n  `Safe growth budget: ${currency} ${fmt(treasury.safe_budget)}`,\n  treasury.warnings?.length ? `Data warnings: ${(treasury.warnings || []).join('; ')}` : '',\n  '',\n  '=== LEADS THIS WEEK ===',\n  `New: ${leadStats.total_leads || 0}  |  Hot: ${leadStats.hot_leads || 0}  |  Warm: ${leadStats.warm_leads || 0}  |  Replied: ${leadStats.replied_leads || 0}`,\n  '',\n  '=== PIPELINE ===',\n  `Stuck deals: ${dealStats.stuck_count || 0}  |  Stuck value: ${currency} ${fmt(dealStats.stuck_value)}`,\n  '',\n  '=== CRITICAL ITEMS THIS WEEK ===',\n  critical.length > 0 ? critical.slice(0, 3).map(formatRec).join('\\n') : 'None',\n  '',\n  '=== HIGH PRIORITY ITEMS ===',\n  high.length > 0 ? high.slice(0, 5).map(formatRec).join('\\n') : 'None',\n  '',\n  '=== MEDIUM ITEMS ===',\n  medium.length > 0 ? medium.slice(0, 3).map(formatRec).join('\\n') : 'None',\n  '',\n  '=== PREVIOUS BRIEF STYLE EXAMPLES ===',\n  ragExamples\n].filter(l => l !== undefined).join('\\n');\n\nconst prompt = `You are a Chief of Staff writing the weekly executive brief for a founder.\n\nYour brief must:\n- Be actionable, not informational\n- Lead with the most urgent item\n- Use specific numbers\n- Max 5 bullet points total\n- Each bullet: [DOMAIN] What happened → Why it matters → What to do TODAY\n- Domains: TREASURY | PIPELINE | LEADS | CASH | SPEND\n- Never use: synergy, leverage, optimize, streamline, paradigm\n- If everything is healthy, say so in 2 bullets and identify one growth opportunity\n\nDATA:\n${context}`;\n\nreturn [{\n  json: {\n    _brief_prompt: prompt,\n    _meta: {\n      rec_counts: { critical: critical.length, high: high.length, medium: medium.length },\n      lead_stats: leadStats,\n      deal_stats: dealStats,\n      treasury: { runway_months: treasury.runway_months, alert_level: treasury.alert_level, currency }\n    }\n  }\n}];"
+      },
+      "id": "build_brief_context",
+      "name": "Build Brief Context (UC8)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [700, 480]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "modelId": "claude-sonnet-4-6",
+        "messages": { "values": [{ "role": "user", "content": "={{$json._brief_prompt}}" }] },
+        "options": { "maxTokens": 700, "temperature": 0.4 }
+      },
+      "id": "claude_brief",
+      "name": "Claude — Generate Brief",
+      "type": "@n8n/n8n-nodes-langchain.anthropic",
+      "typeVersion": 1,
+      "position": [940, 480],
+      "credentials": { "anthropicApi": { "id": "anthropic_main", "name": "Revos Anthropic" } }
+    },
+    {
+      "parameters": {
+        "url": "={{$env.PYTHON_SERVICE_URL}}/validate/llm-output",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [{ "name": "x-service-key", "value": "={{$env.SERVICE_SECRET_KEY}}" }] },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "tenant_id", "value": "={{$env.TENANT_ID}}" },
+            { "name": "output_type", "value": "brief" },
+            { "name": "raw_output", "value": "={{$('Claude — Generate Brief').first().json.content[0].text}}" }
+          ]
+        },
+        "options": { "response": { "response": { "neverError": true } } }
+      },
+      "id": "validate_brief",
+      "name": "Python — Validate Brief",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1180, 480]
+    },
+    {
+      "parameters": {
+        "jsCode": "const meta     = $('Build Brief Context (UC8)').first().json._meta;\nconst validated = $input.first().json;\nconst rawText   = $('Claude — Generate Brief').first().json.content?.[0]?.text || '';\n\nconst briefText = validated.valid ? validated.output : rawText;\nconst t  = meta.treasury || {};\nconst ls = meta.lead_stats || {};\nconst ds = meta.deal_stats || {};\nconst cnt = meta.rec_counts || {};\nconst curr = t.currency || 'USD';\n\nconst alertEmoji = t.alert_level === 'CRITICAL' ? '🚨' : t.alert_level === 'WARNING' ? '⚠️' : '✅';\nconst today = new Date().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'short', year: 'numeric' });\n\nconst slackHeader = [\n  `🧠 *Weekly Revenue OS Brief — ${today}*`,\n  `${alertEmoji} Runway: *${t.runway_months || 'N/A'} months* (${t.alert_level || '?'})  ·  Leads this week: *${ls.total_leads || 0}* (${ls.hot_leads || 0} hot)  ·  Stuck deals: *${ds.stuck_count || 0}*`,\n  `Critical items: ${cnt.critical || 0}  |  High priority: ${cnt.high || 0}`,\n  ''\n].join('\\n');\n\nconst slackMessage = slackHeader + briefText;\n\nconst emailHtml = `<html><body style=\"font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;\">\n<h2 style=\"color: #1a1a2e;\">📊 Weekly Revenue OS Brief</h2>\n<p style=\"color: #666;\">${today}</p>\n<hr/>\n<h3>Summary</h3>\n<pre style=\"white-space: pre-wrap; font-family: Arial; background: #f5f5f5; padding: 15px; border-radius: 5px;\">${briefText}</pre>\n<hr/>\n<h3>Key Metrics</h3>\n<table style=\"width:100%; border-collapse: collapse;\">\n<tr><td style=\"padding: 8px; border: 1px solid #ddd;\">Runway</td><td style=\"padding: 8px; border: 1px solid #ddd;\"><strong>${t.runway_months || 'N/A'} months</strong></td></tr>\n<tr><td style=\"padding: 8px; border: 1px solid #ddd;\">New Leads</td><td style=\"padding: 8px; border: 1px solid #ddd;\">${ls.total_leads || 0} (${ls.hot_leads || 0} hot)</td></tr>\n<tr><td style=\"padding: 8px; border: 1px solid #ddd;\">Stuck Deals</td><td style=\"padding: 8px; border: 1px solid #ddd;\">${ds.stuck_count || 0}</td></tr>\n</table>\n</body></html>`;\n\nreturn [{ json: { brief_text: briefText, slack_message: slackMessage, email_html: emailHtml, meta } }];"
+      },
+      "id": "format_brief",
+      "name": "Format Brief for Delivery (UC9)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1420, 480]
+    },
+    {
+      "parameters": {
+        "webhookUrl": "={{$env.SLACK_WEBHOOK_URL}}",
+        "text": "={{$json.slack_message}}"
+      },
+      "id": "slack_brief",
+      "name": "Slack — Weekly Brief",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 1,
+      "position": [1660, 360],
+      "credentials": { "slackApi": { "id": "slack_main", "name": "Revos Slack" } }
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "table": "brief_snapshots",
+        "additionalFields": {
+          "additionalFields": [
+            { "name": "tenant_id", "value": "={{$env.TENANT_ID}}" },
+            { "name": "brief_text", "value": "={{$json.brief_text}}" },
+            { "name": "raw_context", "value": "={{JSON.stringify($json.meta)}}" },
+            { "name": "week_start", "value": "={{new Date(Date.now() - 6 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]}}" },
+            { "name": "delivered_at", "value": "={{new Date().toISOString()}}" }
+          ]
+        }
+      },
+      "id": "insert_brief",
+      "name": "Supabase — Store Brief",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1660, 540],
+      "credentials": { "postgres": { "id": "supabase_pg", "name": "Supabase PostgreSQL" } }
+    }
+  ],
+  "connections": {
+    "Webhook — Trigger":   { "main": [[{ "node": "Supabase — Week Recommendations", "type": "main", "index": 0 }]] },
+    "Cron — Monday 09:00": { "main": [[{ "node": "Supabase — Week Recommendations", "type": "main", "index": 0 }]] },
+    "Supabase — Week Recommendations": { "main": [[{ "node": "Build Brief Context (UC8)", "type": "main", "index": 0 }]] },
+    "Supabase — Latest Treasury":      { "main": [[{ "node": "Build Brief Context (UC8)", "type": "main", "index": 0 }]] },
+    "Supabase — Lead Stats":           { "main": [[{ "node": "Build Brief Context (UC8)", "type": "main", "index": 0 }]] },
+    "Supabase — Deal Stats":           { "main": [[{ "node": "Build Brief Context (UC8)", "type": "main", "index": 0 }]] },
+    "Supabase — Brief RAG Patterns":   { "main": [[{ "node": "Build Brief Context (UC8)", "type": "main", "index": 0 }]] },
+    "Build Brief Context (UC8)": { "main": [[{ "node": "Claude — Generate Brief", "type": "main", "index": 0 }]] },
+    "Claude — Generate Brief":   { "main": [[{ "node": "Python — Validate Brief", "type": "main", "index": 0 }]] },
+    "Python — Validate Brief":   { "main": [[{ "node": "Format Brief for Delivery (UC9)", "type": "main", "index": 0 }]] },
+    "Format Brief for Delivery (UC9)": { "main": [
+      [{ "node": "Slack — Weekly Brief", "type": "main", "index": 0 }],
+      [{ "node": "Supabase — Store Brief", "type": "main", "index": 0 }]
+    ]}
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1", "errorWorkflow": "error-handler" },
+  "tags": ["revos", "executive"],
+  "meta": { "revos_version": "1.0.0", "description": "UC8+9: aggregates week data, Claude synthesizes brief, validated, delivered to Slack + stored." }
+}
